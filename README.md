@@ -10,6 +10,8 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
 - Keeps the SendGrid API key in an admin-configured password valve
 - Sends plain-text email through SendGrid API v3
 - Shows in-chat progress and error notifications
+- Suppresses repeated sends from the same OpenWebUI message for 24 hours
+- Limits each user to one successful notification every 10 minutes by default
 - Uses only Python's standard library for HTTP requests
 - Masks the destination address in the tool result
 
@@ -22,6 +24,8 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
    - `SENDGRID_API_KEY`: a SendGrid key with **Mail Send** permission
    - `SENDER_EMAIL`: a sender address verified in SendGrid
    - `SENDER_NAME`: the display name recipients will see
+   - `RATE_LIMIT_MINUTES`: minimum delay per user; defaults to `10` and can be
+     set to `0` to disable the cooldown
 5. Enable the tool for the desired model or select it in a chat.
 
 The sender address is configurable because SendGrid requires a verified sender.
@@ -43,6 +47,24 @@ Add this to the model's system prompt if you want conservative tool use:
 | `message` | Plain-text email body, maximum 50,000 characters |
 
 There is intentionally no `to`, `recipient`, `cc`, or `bcc` argument.
+
+## Delivery safeguards
+
+- **Idempotency:** OpenWebUI's injected `__message_id__` identifies the active
+  assistant turn. Once a notification for that message succeeds, repeat calls are
+  suppressed for 24 hours, even if the model changes the subject or body.
+- **Per-user rate limit:** only one successful delivery is allowed per user during
+  `RATE_LIMIT_MINUTES`. The authenticated OpenWebUI user ID is used when available;
+  otherwise the normalized account email is used.
+- **Failures are retryable:** SendGrid failures do not consume the cooldown and do
+  not mark the message as delivered.
+- **Concurrency:** simultaneous calls for the same user are serialized by the
+  safeguards, preventing two requests from passing the checks together.
+
+Safeguard state is held in memory and shared by all tool instances in one Python
+process. It resets when OpenWebUI restarts and is not shared between multiple
+OpenWebUI workers or replicas. Use a shared persistent store if you require
+cross-process or restart-safe enforcement.
 
 ## Test
 
