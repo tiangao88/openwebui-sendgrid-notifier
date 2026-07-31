@@ -456,7 +456,7 @@ def test_renders_at_most_three_mermaid_diagrams(monkeypatch):
     assert "Only the first three" in captured["payload"]["content"][1]["value"]
 
 
-def test_mermaid_renderer_uses_pinned_cli_validates_png_and_cleans_up(monkeypatch):
+def test_mermaid_renderer_uses_home_files_validates_png_and_cleans_up(monkeypatch):
     commands = []
     downloads = []
     png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1_800, 900)
@@ -483,16 +483,59 @@ def test_mermaid_renderer_uses_pinned_cli_validates_png_and_cleans_up(monkeypatc
     assert "timeout 180s" in render_command
     assert "@mermaid-js/mermaid-cli@11.16.0" in render_command
     assert "-t neutral -b white -w 900 -s 2" in render_command
-    assert "/home/user/.openwebui-sendgrid-notifier/" in render_command
+    assert "find /home/user -maxdepth 1" in render_command
+    assert "chmod 644 /home/user/openwebui-mermaid-" in render_command
     assert "flowchart LR" not in render_command
     assert render_wait == 195
     assert cleanup_command.startswith("rm -f ")
-    assert "/home/user/.openwebui-sendgrid-notifier/" in cleanup_command
+    assert "/home/user/openwebui-mermaid-" in cleanup_command
     assert cleanup_wait == 10
-    assert downloads[0][1].startswith(
-        "/home/user/.openwebui-sendgrid-notifier/mermaid-"
-    )
+    assert downloads[0][1].startswith("/home/user/openwebui-mermaid-")
+    assert downloads[0][1].endswith(".png")
     assert downloads[0][2:] == (Tools._MAX_DIAGRAM_BYTES, "Mermaid diagram")
+
+
+def test_mermaid_renderer_retains_png_and_reports_retrieval_stage(monkeypatch):
+    commands = []
+
+    async def fake_run(self, terminal, command, wait_seconds):
+        commands.append(command)
+        return {"status": "done", "exit_code": 0}
+
+    def fake_download(self, terminal, path, max_bytes, label):
+        raise urllib.error.HTTPError(
+            "http://terminal/files/view", 404, "Not Found", {}, None
+        )
+
+    monkeypatch.setattr(Tools, "_run_terminal_command", fake_run)
+    monkeypatch.setattr(Tools, "_download_terminal_path", fake_download)
+    terminal = TerminalContext("http://terminal", {"X-User-Id": "user-1"}, "/home/user")
+
+    with pytest.raises(ValueError, match=r"PNG retrieval failed \(HTTP 404\)") as exc:
+        asyncio.run(
+            configured_tools()._render_mermaid_png(
+                "flowchart LR\nA --> B", 1, terminal
+            )
+        )
+
+    retained_path = str(exc.value).split("retained at ", 1)[1].rstrip(".")
+    assert retained_path.startswith("/home/user/openwebui-mermaid-")
+    assert commands[-1].startswith("rm -f ")
+    assert retained_path not in commands[-1]
+
+
+def test_terminal_http_error_detail_is_bounded_and_safe():
+    error = urllib.error.HTTPError(
+        "http://terminal/execute",
+        404,
+        "Not Found",
+        {},
+        __import__("io").BytesIO(b'{"detail": "route not found"}'),
+    )
+
+    assert Tools._terminal_http_error_detail(error) == (
+        ' Open Terminal response: {"detail": "route not found"}'
+    )
 
 
 def test_mermaid_renderer_resolves_terminal_home_before_creating_files(monkeypatch):

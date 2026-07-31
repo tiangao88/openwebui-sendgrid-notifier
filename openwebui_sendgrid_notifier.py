@@ -4,7 +4,7 @@ author: Aikumi Partners
 author_url: https://aikumipartners.com
 description: Sends a Markdown email notification, optionally with Open Terminal files and rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
 required_open_webui_version: 0.11.0
-version: 1.3.1
+version: 1.3.2
 license: MIT
 """
 
@@ -476,12 +476,26 @@ class Tools:
         self, source: str, diagram_number: int, terminal: TerminalContext
     ) -> bytes:
         token = uuid.uuid4().hex
-        home = terminal.home or await self._get_terminal_home(terminal)
-        directory = posixpath.join(home.rstrip("/"), ".openwebui-sendgrid-notifier")
-        input_path = f"{directory}/mermaid-{token}.mmd"
-        output_path = f"{directory}/mermaid-{token}.png"
-        config_path = f"{directory}/mermaid-{token}.json"
-        puppeteer_path = f"{directory}/puppeteer-{token}.json"
+        try:
+            home = terminal.home or await self._get_terminal_home(terminal)
+        except urllib.error.HTTPError as exc:
+            raise ValueError(
+                "Open Terminal home discovery failed"
+                f" (HTTP {exc.code}).{self._terminal_http_error_detail(exc)}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise ValueError("Open Terminal home discovery could not be reached.") from exc
+        except ValueError as exc:
+            raise ValueError(f"Open Terminal home discovery failed. {exc}") from exc
+
+        # Open Terminal's file API may reject hidden or mode-700 directories even
+        # when /execute can write to them. Keep uniquely named temporary files in
+        # the reported home directory, where /files/view works for normal files.
+        prefix = posixpath.join(home.rstrip("/"), f"openwebui-mermaid-{token}")
+        input_path = f"{prefix}.mmd"
+        output_path = f"{prefix}.png"
+        config_path = f"{prefix}-config.json"
+        puppeteer_path = f"{prefix}-puppeteer.json"
         encoded_source = base64.b64encode(source.encode("utf-8")).decode("ascii")
         mermaid_config = base64.b64encode(
             json.dumps(
@@ -504,7 +518,7 @@ class Tools:
         quoted = {
             name: shlex.quote(value)
             for name, value in {
-                "directory": directory,
+                "home": home,
                 "input": input_path,
                 "output": output_path,
                 "config": config_path,
@@ -517,8 +531,8 @@ class Tools:
         )
         command = (
             "set -eu\n"
-            f"mkdir -p {quoted['directory']}\n"
-            f"chmod 700 {quoted['directory']}\n"
+            f"find {quoted['home']} -maxdepth 1 -type f "
+            "-name 'openwebui-mermaid-*.png' -mmin +15 -delete 2>/dev/null || true\n"
             f"printf %s {shlex.quote(encoded_source)} | base64 -d > {quoted['input']}\n"
             f"printf %s {shlex.quote(mermaid_config)} | base64 -d > {quoted['config']}\n"
             f"printf %s {shlex.quote(puppeteer_config)} | base64 -d > {quoted['puppeteer']}\n"
@@ -527,27 +541,66 @@ class Tools:
             "else\n"
             f"  timeout {self._MERMAID_RENDER_TIMEOUT_SECONDS}s npx --yes "
             f"@mermaid-js/mermaid-cli@{self._MERMAID_CLI_VERSION} {render_args}\n"
-            "fi"
+            "fi\n"
+            f"chmod 644 {quoted['output']}"
         )
-        cleanup_command = "rm -f " + " ".join(
-            [quoted["input"], quoted["output"], quoted["config"], quoted["puppeteer"]]
+        support_cleanup_command = "rm -f " + " ".join(
+            [quoted["input"], quoted["config"], quoted["puppeteer"]]
         )
+        full_cleanup_command = f"{support_cleanup_command} {quoted['output']}"
+        render_completed = False
+        download_completed = False
 
         try:
-            await self._run_terminal_command(
-                terminal, command, self._MERMAID_RENDER_TIMEOUT_SECONDS + 15
-            )
-            content, _content_type = await asyncio.to_thread(
-                self._download_terminal_path,
-                terminal,
-                output_path,
-                self._MAX_DIAGRAM_BYTES,
-                "Mermaid diagram",
-            )
+            try:
+                await self._run_terminal_command(
+                    terminal, command, self._MERMAID_RENDER_TIMEOUT_SECONDS + 15
+                )
+                render_completed = True
+            except urllib.error.HTTPError as exc:
+                raise ValueError(
+                    "Open Terminal command execution failed"
+                    f" (HTTP {exc.code}).{self._terminal_http_error_detail(exc)}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise ValueError(
+                    "Open Terminal command execution could not be reached."
+                ) from exc
+            except ValueError as exc:
+                raise ValueError(
+                    f"Open Terminal command execution failed. {exc}"
+                ) from exc
+
+            try:
+                content, _content_type = await asyncio.to_thread(
+                    self._download_terminal_path,
+                    terminal,
+                    output_path,
+                    self._MAX_DIAGRAM_BYTES,
+                    "Mermaid diagram",
+                )
+                download_completed = True
+            except urllib.error.HTTPError as exc:
+                raise ValueError(
+                    "Open Terminal PNG retrieval failed"
+                    f" (HTTP {exc.code}).{self._terminal_http_error_detail(exc)} "
+                    f"The temporary PNG was retained at {output_path}."
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise ValueError(
+                    "Open Terminal PNG retrieval could not be reached. "
+                    f"The temporary PNG was retained at {output_path}."
+                ) from exc
+
             self._validate_png(content, diagram_number)
             return content
         finally:
             try:
+                cleanup_command = (
+                    full_cleanup_command
+                    if download_completed or not render_completed
+                    else support_cleanup_command
+                )
                 await self._run_terminal_command(terminal, cleanup_command, 10)
             except (
                 ValueError,
@@ -556,6 +609,20 @@ class Tools:
                 TimeoutError,
             ):
                 pass
+
+    @staticmethod
+    def _terminal_http_error_detail(exc: urllib.error.HTTPError) -> str:
+        try:
+            raw = exc.read(2_001)
+        except Exception:
+            return ""
+        if not raw:
+            return ""
+        text = raw[:2_000].decode("utf-8", errors="replace")
+        text = " ".join(text.split())
+        if not text:
+            return ""
+        return f" Open Terminal response: {text[:500]}"
 
     async def _get_terminal_home(self, terminal: TerminalContext) -> str:
         url = f"{terminal.base_url.rstrip('/')}/files/cwd"

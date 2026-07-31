@@ -105,8 +105,10 @@ binary when available; otherwise it runs the pinned
 `@mermaid-js/mermaid-cli@11.16.0` package through `npx`. The first render can take
 longer while npm and Chromium are cached, and Open Terminal must be allowed to
 reach the npm registry and Chromium download host for that fallback. Temporary
-files are created using Open Terminal's reported home directory, independently
-of the current chat working directory.
+files are created directly in Open Terminal's reported home directory,
+independently of the current chat working directory. They use unique visible
+filenames because Open Terminal's file API may reject hidden restricted folders.
+Generated PNGs are set to mode `644` before retrieval.
 
 No new notifier valve or shared Docker volume is required. The standard Open
 Terminal image includes Node.js; minimal images without Node.js need an existing
@@ -120,7 +122,9 @@ Mermaid safeguards:
 - Fixed neutral theme, white background, 900 px base width, and 2x scaling
 - Maximum 1.5 MB per PNG and 3 MB across all inline diagrams
 - Maximum dimensions of 4,000 × 8,000 pixels
-- Automatic cleanup of source, configuration, and PNG files
+- Automatic cleanup of source, configuration, and successfully retrieved PNG files
+- Failed PNG retrievals retain the generated image for diagnosis; stale retained
+  PNGs older than 15 minutes are removed on the next render
 - Graceful source-code fallback when a diagram cannot be rendered
 - A bounded renderer diagnostic in the tool result and email fallback
 
