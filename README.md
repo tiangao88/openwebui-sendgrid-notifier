@@ -102,17 +102,31 @@ flowchart LR
 The notifier invokes Mermaid CLI in Open Terminal, downloads the generated PNG,
 and embeds it using a SendGrid inline CID attachment. It uses an existing `mmdc`
 binary when available; otherwise it runs the pinned
-`@mermaid-js/mermaid-cli@11.16.0` package through `npx`. The first render can take
-longer while npm and Chromium are cached, and Open Terminal must be allowed to
-reach the npm registry and Chromium download host for that fallback. Temporary
-files are created directly in Open Terminal's reported home directory,
+`@mermaid-js/mermaid-cli@11.16.0` package through `npx`.
+
+For reliable Mermaid rendering, configure the **Open Terminal service** (not
+OpenWebUI or the notifier valves) with:
+
+```yaml
+environment:
+  - OPEN_TERMINAL_PACKAGES=chromium
+  - OPEN_TERMINAL_NPM_PACKAGES=@mermaid-js/mermaid-cli@11.16.0
+  - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+  - PUPPETEER_SKIP_DOWNLOAD=true
+```
+
+These package variables require the full Open Terminal image; minimal image
+variants do not support them. Redeploy Open Terminal after adding the variables.
+The first startup can take longer while Chromium and Mermaid CLI are installed.
+
+Temporary files are created directly in Open Terminal's reported home directory,
 independently of the current chat working directory. They use unique visible
 filenames because Open Terminal's file API may reject hidden restricted folders.
 Generated PNGs are set to mode `644` before retrieval.
 
 No new notifier valve or shared Docker volume is required. The standard Open
-Terminal image includes Node.js; minimal images without Node.js need an existing
-`mmdc` installation or will use the source-code fallback.
+Terminal image includes Node.js. If Chromium or Mermaid CLI is unavailable,
+the email is still sent with the Mermaid source as a readable fallback.
 
 Mermaid safeguards:
 
