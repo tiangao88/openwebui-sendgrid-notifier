@@ -8,7 +8,10 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
 
 - Uses OpenWebUI's injected `__user__["email"]` as the only recipient
 - Keeps the SendGrid API key in an admin-configured password valve
-- Sends plain-text email through SendGrid API v3
+- Sends multipart plain-text and styled HTML email through SendGrid API v3
+- Converts Markdown headings, emphasis, lists, links, code blocks, and tables
+- Sanitizes generated HTML with a conservative tag and URL allowlist
+- Renders up to three Mermaid code blocks as inline PNG images through Open Terminal
 - Optionally attaches one file from the Open Terminal selected for the chat
 - Reuses OpenWebUI's system-level Open Terminal URL, credentials, and access grants
 - Enforces a 10 MB attachment limit without passing file bytes through the LLM
@@ -46,6 +49,8 @@ Add this to the model's system prompt if you want conservative tool use:
 > Use `send_email_notification` only when the user explicitly asks for an email
 > notification. Briefly confirm the subject and notification content before calling
 > it. The recipient is automatically the current user's OpenWebUI account email.
+> Write the message in Markdown. Use concise tables where useful and fenced
+> `mermaid` blocks when a diagram materially improves understanding.
 > To attach a generated Open Terminal file, pass its absolute path as
 > `attachment_path`. Never attach a file unless the user explicitly requests it.
 
@@ -54,7 +59,7 @@ Add this to the model's system prompt if you want conservative tool use:
 | Argument | Description |
 |---|---|
 | `subject` | Email subject, maximum 200 characters |
-| `message` | Plain-text email body, maximum 50,000 characters |
+| `message` | Markdown email body, maximum 50,000 characters |
 | `attachment_path` | Optional absolute path to one file in the Open Terminal selected for the chat; maximum file size 10 MB |
 
 There is intentionally no `to`, `recipient`, `cc`, or `bcc` argument.
@@ -73,6 +78,48 @@ This works with terminals configured by an administrator under OpenWebUI's
 system-level integrations. A direct terminal configured only in an individual
 user's browser settings cannot be used because its URL and credentials are not
 available to server-side Workspace Tools.
+
+## Markdown and Mermaid email rendering
+
+The notifier sends the original Markdown first as `text/plain`, followed by a
+sanitized and styled `text/html` alternative. Supported formatting includes
+headings, bold, italic, strikethrough, lists, links, blockquotes, fenced code,
+horizontal rules, and GitHub-style tables. Raw HTML is escaped, remote Markdown
+images are omitted, and links are restricted to `http`, `https`, and `mailto`.
+
+Fenced `mermaid` blocks are rendered automatically when a system-level Open
+Terminal is selected for the chat:
+
+````markdown
+```mermaid
+flowchart LR
+    A[OpenWebUI] --> B[Open Terminal]
+    B --> C[PNG diagram]
+    C --> D[SendGrid email]
+```
+````
+
+The notifier invokes Mermaid CLI in Open Terminal, downloads the generated PNG,
+and embeds it using a SendGrid inline CID attachment. It uses an existing `mmdc`
+binary when available; otherwise it runs the pinned
+`@mermaid-js/mermaid-cli@11.16.0` package through `npx`. The first render can take
+longer while npm and Chromium are cached, and Open Terminal must be allowed to
+reach the npm registry for that fallback.
+
+No new notifier valve or shared Docker volume is required. The standard Open
+Terminal image includes Node.js; minimal images without Node.js need an existing
+`mmdc` installation or will use the source-code fallback.
+
+Mermaid safeguards:
+
+- At most three rendered diagrams per email
+- 90-second render timeout per diagram
+- Mermaid strict security mode with HTML labels disabled
+- Fixed neutral theme, white background, 900 px base width, and 2x scaling
+- Maximum 1.5 MB per PNG and 3 MB across all inline diagrams
+- Maximum dimensions of 4,000 × 8,000 pixels
+- Automatic cleanup of source, configuration, and PNG files
+- Graceful source-code fallback when a diagram cannot be rendered
 
 ## Delivery safeguards
 
@@ -109,6 +156,8 @@ Tests mock the SendGrid endpoint and never send real email.
 - Restrict tool availability if users should not be able to trigger notifications.
 - Attachment access is limited to the Open Terminal selected for the chat and is
   checked against the same system connection access grants as OpenWebUI.
+- Mermaid rendering runs a pinned CLI package inside the selected Open Terminal.
+  It does not send diagram source to a third-party rendering service.
 - The tool depends on OpenWebUI's current internal configuration API. Re-test
   attachments after major OpenWebUI upgrades.
 - SendGrid may still enforce account, sender-verification, and rate limits.

@@ -2,27 +2,33 @@
 title: SendGrid Email Notification
 author: Aikumi Partners
 author_url: https://aikumipartners.com
-description: Sends an email notification, optionally with an Open Terminal attachment, to the current OpenWebUI user's account email through SendGrid.
+description: Sends a Markdown email notification, optionally with Open Terminal files and rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
 required_open_webui_version: 0.11.0
-version: 1.2.0
+version: 1.3.0
 license: MIT
 """
 
 import asyncio
 import base64
+import html
 import json
 import math
 import mimetypes
 import posixpath
 import re
+import shlex
+import struct
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from html.parser import HTMLParser
 from types import SimpleNamespace
 from typing import Awaitable, Callable, ClassVar, NamedTuple, Optional
 
+import markdown
 from pydantic import BaseModel, Field
 
 
@@ -33,6 +39,21 @@ class EmailAttachment(NamedTuple):
     content: bytes
     filename: str
     content_type: str
+    disposition: str = "attachment"
+    content_id: Optional[str] = None
+
+
+class EmailBody(NamedTuple):
+    plain: str
+    html: str
+    inline_attachments: list[EmailAttachment]
+    mermaid_total: int
+    mermaid_rendered: int
+
+
+class TerminalContext(NamedTuple):
+    base_url: str
+    headers: dict[str, str]
 
 
 class DuplicateNotificationError(Exception):
@@ -47,6 +68,127 @@ class NotificationRateLimitError(Exception):
         super().__init__(f"Retry after {retry_after_seconds} seconds.")
 
 
+class _EmailHTMLSanitizer(HTMLParser):
+    """Allow only email-safe Markdown output and apply fixed inline styles."""
+
+    _ALLOWED_TAGS = {
+        "a",
+        "blockquote",
+        "br",
+        "code",
+        "del",
+        "em",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "hr",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "strong",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+    _DANGEROUS_TAGS = {"embed", "form", "iframe", "object", "script", "style", "svg"}
+    _VOID_TAGS = {"br", "hr"}
+    _STYLES = {
+        "a": "color:#2563eb;text-decoration:underline;",
+        "blockquote": "border-left:4px solid #cbd5e1;color:#475569;margin:16px 0;padding:4px 16px;",
+        "br": "",
+        "code": "background:#f1f5f9;border-radius:4px;color:#0f172a;font-family:SFMono-Regular,Consolas,Liberation Mono,monospace;font-size:0.92em;padding:2px 5px;",
+        "del": "color:#64748b;",
+        "em": "",
+        "h1": "color:#0f172a;font-size:26px;line-height:1.25;margin:0 0 18px;",
+        "h2": "color:#0f172a;font-size:22px;line-height:1.3;margin:26px 0 12px;",
+        "h3": "color:#1e293b;font-size:18px;line-height:1.35;margin:22px 0 10px;",
+        "h4": "color:#1e293b;font-size:16px;line-height:1.4;margin:18px 0 8px;",
+        "hr": "border:0;border-top:1px solid #e2e8f0;margin:24px 0;",
+        "li": "margin:5px 0;",
+        "ol": "margin:12px 0;padding-left:26px;",
+        "p": "margin:0 0 14px;",
+        "pre": "background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;box-sizing:border-box;line-height:1.45;margin:14px 0;max-width:100%;overflow-wrap:anywhere;padding:14px;white-space:pre-wrap;",
+        "strong": "",
+        "table": "border-collapse:collapse;margin:18px 0;max-width:100%;width:100%;",
+        "tbody": "",
+        "td": "border:1px solid #cbd5e1;padding:9px 10px;text-align:left;vertical-align:top;",
+        "th": "background:#f1f5f9;border:1px solid #cbd5e1;color:#0f172a;font-weight:600;padding:9px 10px;text-align:left;vertical-align:top;",
+        "thead": "",
+        "tr": "",
+        "ul": "margin:12px 0;padding-left:26px;",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._suppressed_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        if tag in self._DANGEROUS_TAGS:
+            self._suppressed_depth += 1
+            return
+        if self._suppressed_depth or tag not in self._ALLOWED_TAGS:
+            return
+
+        safe_attrs = [f'style="{html.escape(self._STYLES.get(tag, ""), quote=True)}"']
+        if tag == "a":
+            attr_map = {name.lower(): value or "" for name, value in attrs}
+            href = self._safe_href(attr_map.get("href", ""))
+            if href:
+                safe_attrs.extend(
+                    [
+                        f'href="{html.escape(href, quote=True)}"',
+                        'rel="noopener noreferrer"',
+                        'target="_blank"',
+                    ]
+                )
+            title = attr_map.get("title", "").strip()
+            if title:
+                safe_attrs.append(f'title="{html.escape(title[:500], quote=True)}"')
+
+        suffix = " /" if tag in self._VOID_TAGS else ""
+        self._parts.append(f"<{tag} {' '.join(safe_attrs)}{suffix}>")
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._DANGEROUS_TAGS and self._suppressed_depth:
+            self._suppressed_depth -= 1
+            return
+        if self._suppressed_depth or tag not in self._ALLOWED_TAGS or tag in self._VOID_TAGS:
+            return
+        self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self._suppressed_depth:
+            self._parts.append(html.escape(data, quote=False))
+
+    def get_html(self) -> str:
+        return "".join(self._parts)
+
+    @staticmethod
+    def _safe_href(value: str) -> str:
+        href = "".join(character for character in value.strip() if ord(character) >= 32)
+        if not href or len(href) > 2_048:
+            return ""
+        try:
+            scheme = urllib.parse.urlsplit(href).scheme.casefold()
+        except ValueError:
+            return ""
+        return href if scheme in {"http", "https", "mailto"} else ""
+
+
 class Tools:
     # OpenWebUI can create more than one Tools instance in a process. Class-level
     # state makes the safeguards apply across those instances.
@@ -57,6 +199,20 @@ class Tools:
     _inflight_message_ids: ClassVar[set[tuple[str, str]]] = set()
     _IDEMPOTENCY_TTL_SECONDS: ClassVar[int] = 24 * 60 * 60
     _MAX_ATTACHMENT_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    _MAX_MERMAID_DIAGRAMS: ClassVar[int] = 3
+    _MAX_DIAGRAM_BYTES: ClassVar[int] = 1_500_000
+    _MAX_TOTAL_DIAGRAM_BYTES: ClassVar[int] = 3_000_000
+    _MAX_DIAGRAM_WIDTH: ClassVar[int] = 4_000
+    _MAX_DIAGRAM_HEIGHT: ClassVar[int] = 8_000
+    _MERMAID_RENDER_TIMEOUT_SECONDS: ClassVar[int] = 90
+    _MERMAID_CLI_VERSION: ClassVar[str] = "11.16.0"
+    _MERMAID_FENCE_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"^```[ \t]*mermaid[ \t]*\r?\n(.*?)^```[ \t]*$",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    _MARKDOWN_IMAGE_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"!\[([^\]]*)\]\([^\n)]*\)"
+    )
 
     class Valves(BaseModel):
         SENDGRID_API_KEY: str = Field(
@@ -104,7 +260,7 @@ class Tools:
         Never ask for, infer, or accept a destination email address.
 
         :param subject: Short, descriptive email subject.
-        :param message: Plain-text notification body. Include all information the user needs.
+        :param message: Email body in Markdown. You may use headings, emphasis, lists, links, code blocks, concise tables, and Mermaid code blocks. Do not include raw HTML or remote images.
         :param attachment_path: Optional absolute path to one file in the Open Terminal selected for this chat. Leave empty for no attachment.
         :return: A delivery confirmation or a safe error message.
         """
@@ -119,6 +275,15 @@ class Tools:
             reservation = self._reserve_delivery(user_key, message_id)
 
             try:
+                email_body = await self._build_email_body(
+                    message,
+                    __request__,
+                    __user__,
+                    __metadata__,
+                    __oauth_token__,
+                    __event_emitter__,
+                )
+
                 attachment = None
                 if attachment_path.strip():
                     await self._emit(
@@ -139,7 +304,7 @@ class Tools:
                     self._send_via_sendgrid,
                     recipient,
                     subject,
-                    message,
+                    email_body,
                     attachment,
                 )
             except BaseException:
@@ -148,7 +313,16 @@ class Tools:
             self._complete_delivery(reservation)
 
             await self._emit(__event_emitter__, "Email notification sent.", True)
-            return f"Email notification sent successfully to {self._mask_email(recipient)}."
+            result = f"Email notification sent successfully to {self._mask_email(recipient)}."
+            if email_body.mermaid_total:
+                failures = email_body.mermaid_total - email_body.mermaid_rendered
+                result += (
+                    f" Embedded {email_body.mermaid_rendered} of "
+                    f"{email_body.mermaid_total} Mermaid diagram(s)."
+                )
+                if failures:
+                    result += f" {failures} diagram(s) were included as source fallback."
+            return result
         except DuplicateNotificationError:
             detail = "A notification was already sent for this message; duplicate suppressed."
             await self._emit(__event_emitter__, detail, True, "complete")
@@ -170,6 +344,239 @@ class Tools:
             await self._emit(__event_emitter__, detail, True, "error")
             return f"Email notification was not sent: {detail}"
 
+    async def _build_email_body(
+        self,
+        message: str,
+        request,
+        user: Optional[dict],
+        metadata: Optional[dict],
+        oauth_token: Optional[dict],
+        emitter: Optional[EventEmitter],
+    ) -> EmailBody:
+        diagrams: list[str] = []
+
+        def replace_mermaid(match: re.Match[str]) -> str:
+            index = len(diagrams)
+            diagrams.append(match.group(1).strip())
+            return f"\n\nOPENWEBUI_MERMAID_PLACEHOLDER_{index}\n\n"
+
+        markdown_source = self._MERMAID_FENCE_RE.sub(replace_mermaid, message)
+        markdown_source = self._MARKDOWN_IMAGE_RE.sub(
+            lambda match: f"[Remote image omitted: {match.group(1).strip() or 'image'}]",
+            markdown_source,
+        )
+        rendered = markdown.markdown(
+            html.escape(markdown_source, quote=False),
+            extensions=["tables", "fenced_code", "sane_lists", "pymdownx.tilde"],
+            extension_configs={"pymdownx.tilde": {"subscript": False}},
+            output_format="html",
+        )
+        sanitizer = _EmailHTMLSanitizer()
+        sanitizer.feed(rendered)
+        sanitizer.close()
+        safe_html = sanitizer.get_html()
+
+        inline_attachments: list[EmailAttachment] = []
+        rendered_count = 0
+        terminal_context: Optional[TerminalContext] = None
+        terminal_unavailable = False
+
+        if diagrams:
+            await self._emit(emitter, "Rendering Mermaid diagrams…", False)
+            try:
+                terminal_context = await self._get_open_terminal_context(
+                    request, user, metadata, oauth_token
+                )
+            except ValueError:
+                terminal_unavailable = True
+
+        total_inline_bytes = 0
+        for index, source in enumerate(diagrams):
+            diagram_number = index + 1
+            replacement: str
+            if index >= self._MAX_MERMAID_DIAGRAMS:
+                replacement = self._mermaid_fallback_html(
+                    source, "Only the first three Mermaid diagrams can be rendered per email."
+                )
+            elif terminal_unavailable or terminal_context is None:
+                replacement = self._mermaid_fallback_html(
+                    source, "No usable system-level Open Terminal was selected for rendering."
+                )
+            else:
+                try:
+                    png = await self._render_mermaid_png(
+                        source, diagram_number, terminal_context
+                    )
+                    if total_inline_bytes + len(png) > self._MAX_TOTAL_DIAGRAM_BYTES:
+                        raise ValueError("The combined Mermaid image limit was exceeded.")
+                    content_id = f"openwebui-mermaid-{uuid.uuid4().hex}"
+                    inline_attachments.append(
+                        EmailAttachment(
+                            png,
+                            f"mermaid-diagram-{diagram_number}.png",
+                            "image/png",
+                            "inline",
+                            content_id,
+                        )
+                    )
+                    total_inline_bytes += len(png)
+                    rendered_count += 1
+                    replacement = self._mermaid_image_html(content_id, diagram_number)
+                except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+                    replacement = self._mermaid_fallback_html(
+                        source, "The Mermaid diagram could not be rendered."
+                    )
+
+            placeholder = f"OPENWEBUI_MERMAID_PLACEHOLDER_{index}"
+            safe_html = re.sub(
+                rf"<p\b[^>]*>\s*{re.escape(placeholder)}\s*</p>",
+                lambda _match, value=replacement: value,
+                safe_html,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        document = (
+            '<!doctype html><html><body style="background:#ffffff;color:#1e293b;'
+            'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
+            'font-size:15px;line-height:1.6;margin:0;padding:0;">'
+            '<div style="box-sizing:border-box;margin:0 auto;max-width:720px;padding:28px 22px;">'
+            f"{safe_html}</div></body></html>"
+        )
+        return EmailBody(message, document, inline_attachments, len(diagrams), rendered_count)
+
+    async def _render_mermaid_png(
+        self, source: str, diagram_number: int, terminal: TerminalContext
+    ) -> bytes:
+        token = uuid.uuid4().hex
+        directory = ".openwebui-sendgrid-notifier"
+        input_path = f"{directory}/mermaid-{token}.mmd"
+        output_path = f"{directory}/mermaid-{token}.png"
+        config_path = f"{directory}/mermaid-{token}.json"
+        puppeteer_path = f"{directory}/puppeteer-{token}.json"
+        encoded_source = base64.b64encode(source.encode("utf-8")).decode("ascii")
+        mermaid_config = base64.b64encode(
+            json.dumps(
+                {
+                    "securityLevel": "strict",
+                    "htmlLabels": False,
+                    "flowchart": {"htmlLabels": False},
+                    "maxTextSize": 50_000,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).decode("ascii")
+        puppeteer_config = base64.b64encode(
+            json.dumps(
+                {"args": ["--no-sandbox", "--disable-setuid-sandbox"]},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).decode("ascii")
+
+        quoted = {name: shlex.quote(value) for name, value in {
+            "directory": directory,
+            "input": input_path,
+            "output": output_path,
+            "config": config_path,
+            "puppeteer": puppeteer_path,
+        }.items()}
+        render_args = (
+            f"-i {quoted['input']} -o {quoted['output']} -c {quoted['config']} "
+            f"-p {quoted['puppeteer']} -t neutral -b white -w 900 -s 2"
+        )
+        command = (
+            "set -eu\n"
+            f"mkdir -p {quoted['directory']}\n"
+            f"chmod 700 {quoted['directory']}\n"
+            f"printf %s {shlex.quote(encoded_source)} | base64 -d > {quoted['input']}\n"
+            f"printf %s {shlex.quote(mermaid_config)} | base64 -d > {quoted['config']}\n"
+            f"printf %s {shlex.quote(puppeteer_config)} | base64 -d > {quoted['puppeteer']}\n"
+            "if command -v mmdc >/dev/null 2>&1; then\n"
+            f"  timeout {self._MERMAID_RENDER_TIMEOUT_SECONDS}s mmdc {render_args}\n"
+            "else\n"
+            f"  timeout {self._MERMAID_RENDER_TIMEOUT_SECONDS}s npx --yes "
+            f"@mermaid-js/mermaid-cli@{self._MERMAID_CLI_VERSION} {render_args}\n"
+            "fi"
+        )
+        cleanup_command = (
+            "rm -f "
+            + " ".join(
+                [quoted["input"], quoted["output"], quoted["config"], quoted["puppeteer"]]
+            )
+        )
+
+        try:
+            await self._run_terminal_command(
+                terminal, command, self._MERMAID_RENDER_TIMEOUT_SECONDS + 15
+            )
+            content, _content_type = await asyncio.to_thread(
+                self._download_terminal_path,
+                terminal,
+                output_path,
+                self._MAX_DIAGRAM_BYTES,
+                "Mermaid diagram",
+            )
+            self._validate_png(content, diagram_number)
+            return content
+        finally:
+            try:
+                await self._run_terminal_command(terminal, cleanup_command, 10)
+            except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+                pass
+
+    async def _run_terminal_command(
+        self, terminal: TerminalContext, command: str, wait_seconds: int
+    ) -> dict:
+        query_wait = min(max(wait_seconds, 1), 300)
+        url = (
+            f"{terminal.base_url.rstrip('/')}/execute?"
+            + urllib.parse.urlencode({"wait": query_wait, "tail": 30})
+        )
+        result = await asyncio.to_thread(
+            self._request_terminal_json,
+            url,
+            terminal.headers,
+            "POST",
+            {"command": command},
+            query_wait + 10,
+        )
+        if result.get("status") == "running":
+            raise TimeoutError("Open Terminal did not finish the command in time.")
+        if result.get("exit_code") != 0:
+            raise ValueError("Open Terminal could not render the Mermaid diagram.")
+        return result
+
+    def _request_terminal_json(
+        self,
+        url: str,
+        headers: dict[str, str],
+        method: str,
+        payload: Optional[dict],
+        timeout: int,
+    ) -> dict:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        terminal_request = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                **headers,
+                "Content-Type": "application/json",
+                "User-Agent": "openwebui-sendgrid-notifier/1.3",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(terminal_request, timeout=timeout) as response:
+            raw = response.read(1_000_001)
+            if len(raw) > 1_000_000:
+                raise ValueError("Open Terminal returned an oversized response.")
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Open Terminal returned an invalid response.") from exc
+        if not isinstance(result, dict):
+            raise ValueError("Open Terminal returned an invalid response.")
+        return result
+
     async def _get_open_terminal_attachment(
         self,
         attachment_path: str,
@@ -179,6 +586,41 @@ class Tools:
         oauth_token: Optional[dict],
     ) -> EmailAttachment:
         path, filename = self._clean_attachment_path(attachment_path)
+        terminal = await self._get_open_terminal_context(
+            request, user, metadata, oauth_token
+        )
+        try:
+            content, content_type = await asyncio.to_thread(
+                self._download_terminal_path,
+                terminal,
+                path,
+                self._MAX_ATTACHMENT_BYTES,
+                "attachment",
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise ValueError("The Open Terminal attachment file was not found.") from exc
+            if exc.code in (401, 403):
+                raise ValueError(
+                    "Open Terminal rejected access to the attachment file."
+                ) from exc
+            raise ValueError(
+                f"Open Terminal could not return the attachment (HTTP {exc.code})."
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise ValueError("Open Terminal could not be reached.") from exc
+
+        if not content_type:
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return EmailAttachment(content, filename, content_type)
+
+    async def _get_open_terminal_context(
+        self,
+        request,
+        user: Optional[dict],
+        metadata: Optional[dict],
+        oauth_token: Optional[dict],
+    ) -> TerminalContext:
         terminal_id = str((metadata or {}).get("terminal_id") or "").strip()
         if not terminal_id:
             raise ValueError(
@@ -233,8 +675,7 @@ class Tools:
             headers["Authorization"] = f"Bearer {api_key}"
         elif auth_type == "session":
             credentials = str(
-                getattr(getattr(request.state, "token", None), "credentials", "")
-                or ""
+                getattr(getattr(request.state, "token", None), "credentials", "") or ""
             ).strip()
             if not credentials:
                 raise ValueError("The Open Terminal session credentials are unavailable.")
@@ -252,36 +693,25 @@ class Tools:
                 f"Open Terminal authentication type '{auth_type}' is not supported."
             )
 
-        url = f"{base_url.rstrip('/')}/files/view?{urllib.parse.urlencode({'path': path})}"
-        try:
-            content, content_type = await asyncio.to_thread(
-                self._download_terminal_file, url, headers
-            )
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                raise ValueError("The Open Terminal attachment file was not found.") from exc
-            if exc.code in (401, 403):
-                raise ValueError(
-                    "Open Terminal rejected access to the attachment file."
-                ) from exc
-            raise ValueError(
-                f"Open Terminal could not return the attachment (HTTP {exc.code})."
-            ) from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise ValueError("Open Terminal could not be reached.") from exc
+        return TerminalContext(base_url, headers)
 
-        if not content_type:
-            content_type = (
-                mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            )
-        return EmailAttachment(content, filename, content_type)
-
-    def _download_terminal_file(
-        self, url: str, headers: dict[str, str]
+    def _download_terminal_path(
+        self,
+        terminal: TerminalContext,
+        path: str,
+        max_bytes: int,
+        label: str,
     ) -> tuple[bytes, str]:
+        url = (
+            f"{terminal.base_url.rstrip('/')}/files/view?"
+            + urllib.parse.urlencode({"path": path})
+        )
         terminal_request = urllib.request.Request(
             url,
-            headers={**headers, "User-Agent": "openwebui-sendgrid-notifier/1.2"},
+            headers={
+                **terminal.headers,
+                "User-Agent": "openwebui-sendgrid-notifier/1.3",
+            },
             method="GET",
         )
         with urllib.request.urlopen(terminal_request, timeout=30) as response:
@@ -291,19 +721,50 @@ class Tools:
                     reported_size = int(content_length)
                 except (TypeError, ValueError):
                     reported_size = None
-                if (
-                    reported_size is not None
-                    and reported_size > self._MAX_ATTACHMENT_BYTES
-                ):
-                    raise ValueError("The attachment exceeds the 10 MB size limit.")
+                if reported_size is not None and reported_size > max_bytes:
+                    raise ValueError(
+                        f"The {label} exceeds the {self._format_bytes(max_bytes)} size limit."
+                    )
 
-            content = response.read(self._MAX_ATTACHMENT_BYTES + 1)
-            if len(content) > self._MAX_ATTACHMENT_BYTES:
-                raise ValueError("The attachment exceeds the 10 MB size limit.")
+            content = response.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                raise ValueError(
+                    f"The {label} exceeds the {self._format_bytes(max_bytes)} size limit."
+                )
             content_type = response.headers.get("Content-Type", "").split(";", 1)[
                 0
             ].strip()
             return content, content_type
+
+    @classmethod
+    def _validate_png(cls, content: bytes, diagram_number: int) -> None:
+        if len(content) < 24 or not content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError(f"Mermaid diagram {diagram_number} was not rendered as PNG.")
+        width, height = struct.unpack(">II", content[16:24])
+        if width > cls._MAX_DIAGRAM_WIDTH or height > cls._MAX_DIAGRAM_HEIGHT:
+            raise ValueError(f"Mermaid diagram {diagram_number} is too large for email.")
+
+    @staticmethod
+    def _mermaid_image_html(content_id: str, diagram_number: int) -> str:
+        return (
+            '<div style="margin:20px 0;text-align:center;">'
+            f'<img src="cid:{html.escape(content_id, quote=True)}" '
+            f'alt="Mermaid diagram {diagram_number}" '
+            'style="display:block;height:auto;margin:0 auto;max-width:100%;width:auto;" />'
+            "</div>"
+        )
+
+    @staticmethod
+    def _mermaid_fallback_html(source: str, reason: str) -> str:
+        return (
+            '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;'
+            'margin:18px 0;padding:14px;">'
+            f'<p style="color:#9a3412;font-weight:600;margin:0 0 10px;">{html.escape(reason)}</p>'
+            '<pre style="background:#ffffff;border:1px solid #e2e8f0;border-radius:4px;'
+            'color:#0f172a;font-family:SFMono-Regular,Consolas,Liberation Mono,monospace;'
+            'font-size:13px;line-height:1.45;margin:0;overflow-wrap:anywhere;padding:12px;'
+            f'white-space:pre-wrap;">{html.escape(source)}</pre></div>'
+        )
 
     @staticmethod
     def _clean_attachment_path(path: str) -> tuple[str, str]:
@@ -316,9 +777,7 @@ class Tools:
             raise ValueError("The Open Terminal attachment path must be absolute.")
 
         filename = posixpath.basename(value.rstrip("/"))
-        filename = "".join(
-            character for character in filename if ord(character) >= 32
-        ).strip()
+        filename = "".join(character for character in filename if ord(character) >= 32).strip()
         if not filename:
             raise ValueError("The attachment path must identify a file.")
         if len(filename) > 255:
@@ -426,6 +885,12 @@ class Tools:
         return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
     @staticmethod
+    def _format_bytes(size: int) -> str:
+        if size % (1024 * 1024) == 0:
+            return f"{size // (1024 * 1024)} MB"
+        return f"{size / (1024 * 1024):.1f} MB"
+
+    @staticmethod
     def _clean_subject(subject: str) -> str:
         value = " ".join(subject.split()).strip()
         if not value:
@@ -447,7 +912,7 @@ class Tools:
         self,
         recipient: str,
         subject: str,
-        message: str,
+        email_body: EmailBody,
         attachment: Optional[EmailAttachment] = None,
     ) -> None:
         payload = {
@@ -457,24 +922,34 @@ class Tools:
                 "name": self.valves.SENDER_NAME.strip() or "OpenWebUI",
             },
             "subject": subject,
-            "content": [{"type": "text/plain", "value": message}],
+            "content": [
+                {"type": "text/plain", "value": email_body.plain},
+                {"type": "text/html", "value": email_body.html},
+            ],
         }
+        attachments = list(email_body.inline_attachments)
         if attachment:
-            payload["attachments"] = [
-                {
-                    "content": base64.b64encode(attachment.content).decode("ascii"),
-                    "type": attachment.content_type,
-                    "filename": attachment.filename,
-                    "disposition": "attachment",
+            attachments.append(attachment)
+        if attachments:
+            payload["attachments"] = []
+            for item in attachments:
+                encoded = {
+                    "content": base64.b64encode(item.content).decode("ascii"),
+                    "type": item.content_type,
+                    "filename": item.filename,
+                    "disposition": item.disposition,
                 }
-            ]
+                if item.content_id:
+                    encoded["content_id"] = item.content_id
+                payload["attachments"].append(encoded)
+
         request = urllib.request.Request(
             "https://api.sendgrid.com/v3/mail/send",
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.valves.SENDGRID_API_KEY.strip()}",
                 "Content-Type": "application/json",
-                "User-Agent": "openwebui-sendgrid-notifier/1.2",
+                "User-Agent": "openwebui-sendgrid-notifier/1.3",
             },
             method="POST",
         )
