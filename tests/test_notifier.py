@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import struct
 import sys
 import types
 import urllib.error
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from openwebui_sendgrid_notifier import EmailAttachment, Tools
+from openwebui_sendgrid_notifier import EmailAttachment, TerminalContext, Tools
 
 
 class Response:
@@ -66,15 +67,19 @@ def test_sends_only_to_authenticated_user(monkeypatch):
         {"to": [{"email": "stephan@example.org"}]}
     ]
     assert captured["payload"]["subject"] == "Report ready"
+    assert [item["type"] for item in captured["payload"]["content"]] == [
+        "text/plain",
+        "text/html",
+    ]
+    assert captured["payload"]["content"][0]["value"] == "Your report is ready."
+    assert "Your report is ready." in captured["payload"]["content"][1]["value"]
     assert "attachments" not in captured["payload"]
 
 
 def test_sends_file_from_selected_open_terminal(monkeypatch):
     captured = {}
 
-    async def fake_get_attachment(
-        self, path, request, user, metadata, oauth_token
-    ):
+    async def fake_get_attachment(self, path, request, user, metadata, oauth_token):
         captured["attachment_request"] = {
             "path": path,
             "request": request,
@@ -208,9 +213,9 @@ def test_reads_selected_terminal_from_openwebui_configuration(monkeypatch):
         "open_webui.utils.terminals": types.ModuleType("open_webui.utils.terminals"),
     }
     module_map["open_webui.models.config"].Config = FakeConfig
-    module_map[
-        "open_webui.utils.access_control"
-    ].has_connection_access = fake_has_connection_access
+    module_map["open_webui.utils.access_control"].has_connection_access = (
+        fake_has_connection_access
+    )
     module_map["open_webui.utils.terminals"].get_terminal_server_url = (
         lambda connection: connection["url"]
     )
@@ -260,7 +265,377 @@ def test_rejects_oversized_terminal_attachment(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="exceeds the 10 MB"):
-        configured_tools()._download_terminal_file("http://terminal/file", {})
+        configured_tools()._download_terminal_path(
+            TerminalContext("http://terminal", {}),
+            "/file",
+            Tools._MAX_ATTACHMENT_BYTES,
+            "attachment",
+        )
+
+
+def test_renders_markdown_table_and_unicode_as_styled_html(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    message = """## Weekly report
+
+**Status:** On track ✅
+
+| Workstream | Owner |
+|---|---|
+| Data migration | Alice |
+"""
+    result = asyncio.run(
+        configured_tools().send_email_notification(
+            "Weekly report", message, __user__={"email": "user@example.org"}
+        )
+    )
+
+    assert "sent successfully" in result
+    plain, rich = captured["payload"]["content"]
+    assert plain == {"type": "text/plain", "value": message.strip()}
+    assert rich["type"] == "text/html"
+    assert "<h2 " in rich["value"]
+    assert "<strong " in rich["value"]
+    assert "<table " in rich["value"]
+    assert "border-collapse:collapse" in rich["value"]
+    assert "background:#f1f5f9" in rich["value"]
+    assert "On track ✅" in rich["value"]
+
+
+def test_sanitizes_raw_html_unsafe_links_and_remote_images(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    message = """<script>alert('x')</script>
+
+[Unsafe](javascript:alert(1))
+
+[Safe](https://example.com/report?a=1&b=2)
+
+![tracking pixel](https://tracker.example/pixel.png)
+"""
+    asyncio.run(
+        configured_tools().send_email_notification(
+            "Security test", message, __user__={"email": "user@example.org"}
+        )
+    )
+
+    rich = captured["payload"]["content"][1]["value"]
+    assert "<script" not in rich
+    assert "&lt;script&gt;" in rich
+    assert "javascript:" not in rich
+    assert 'href="https://example.com/report?a=1&amp;b=2"' in rich
+    assert "tracker.example" not in rich
+    assert "Remote image omitted: tracking pixel" in rich
+
+
+def test_embeds_rendered_mermaid_as_inline_cid_attachment(monkeypatch):
+    captured = {}
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1_800, 900)
+
+    async def fake_context(self, request, user, metadata, oauth_token):
+        return TerminalContext("http://terminal", {"Authorization": "Bearer test"})
+
+    async def fake_render(self, source, diagram_number, terminal):
+        captured["source"] = source
+        captured["diagram_number"] = diagram_number
+        captured["terminal"] = terminal
+        return png
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr(Tools, "_get_open_terminal_context", fake_context)
+    monkeypatch.setattr(Tools, "_render_mermaid_png", fake_render)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    message = """## Architecture
+
+```mermaid
+flowchart LR
+    A[OpenWebUI] --> B[Email]
+```
+"""
+    result = asyncio.run(
+        configured_tools().send_email_notification(
+            "Architecture",
+            message,
+            __user__={"id": "user-1", "email": "user@example.org"},
+            __metadata__={"terminal_id": "terminal-1"},
+            __request__=object(),
+        )
+    )
+
+    assert "Embedded 1 of 1 Mermaid diagram" in result
+    assert captured["source"] == "flowchart LR\n    A[OpenWebUI] --> B[Email]"
+    assert captured["diagram_number"] == 1
+    assert captured["terminal"].base_url == "http://terminal"
+    payload = captured["payload"]
+    assert payload["content"][0]["value"] == message.strip()
+    inline = payload["attachments"][0]
+    assert inline["disposition"] == "inline"
+    assert inline["type"] == "image/png"
+    assert inline["filename"] == "mermaid-diagram-1.png"
+    assert base64.b64decode(inline["content"]) == png
+    assert f'cid:{inline["content_id"]}' in payload["content"][1]["value"]
+    assert "flowchart LR" not in payload["content"][1]["value"]
+
+
+def test_mermaid_failure_falls_back_to_escaped_source_and_still_sends(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    message = """```mermaid
+flowchart LR
+    A[One] --> B[Two]
+```"""
+    result = asyncio.run(
+        configured_tools().send_email_notification(
+            "Diagram",
+            message,
+            __user__={"id": "user-1", "email": "user@example.org"},
+        )
+    )
+
+    assert "Embedded 0 of 1 Mermaid diagram" in result
+    assert "source fallback" in result
+    assert "attachments" not in captured["payload"]
+    rich = captured["payload"]["content"][1]["value"]
+    assert "No usable system-level Open Terminal" in rich
+    assert "flowchart LR" in rich
+    assert "A[One] --&gt; B[Two]" in rich
+
+
+def test_renders_at_most_three_mermaid_diagrams(monkeypatch):
+    captured = {"rendered": []}
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1_800, 900)
+
+    async def fake_context(self, request, user, metadata, oauth_token):
+        return TerminalContext("http://terminal", {})
+
+    async def fake_render(self, source, diagram_number, terminal):
+        captured["rendered"].append(diagram_number)
+        return png
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr(Tools, "_get_open_terminal_context", fake_context)
+    monkeypatch.setattr(Tools, "_render_mermaid_png", fake_render)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    message = "\n\n".join(
+        f"```mermaid\nflowchart LR\nA{i} --> B{i}\n```" for i in range(4)
+    )
+    result = asyncio.run(
+        configured_tools().send_email_notification(
+            "Four diagrams",
+            message,
+            __user__={"id": "user-1", "email": "user@example.org"},
+            __metadata__={"terminal_id": "terminal-1"},
+            __request__=object(),
+        )
+    )
+
+    assert captured["rendered"] == [1, 2, 3]
+    assert len(captured["payload"]["attachments"]) == 3
+    assert "Embedded 3 of 4 Mermaid diagram" in result
+    assert "Only the first three" in captured["payload"]["content"][1]["value"]
+
+
+def test_mermaid_renderer_uses_home_files_validates_png_and_cleans_up(monkeypatch):
+    commands = []
+    downloads = []
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 1_800, 900)
+
+    async def fake_run(self, terminal, command, wait_seconds):
+        commands.append((command, wait_seconds))
+        return {"status": "done", "exit_code": 0}
+
+    def fake_download(self, terminal, path, max_bytes, label):
+        downloads.append((terminal, path, max_bytes, label))
+        return png, "image/png"
+
+    monkeypatch.setattr(Tools, "_run_terminal_command", fake_run)
+    monkeypatch.setattr(Tools, "_download_terminal_path", fake_download)
+    terminal = TerminalContext("http://terminal", {"X-User-Id": "user-1"}, "/home/user")
+    result = asyncio.run(
+        configured_tools()._render_mermaid_png("flowchart LR\nA --> B", 1, terminal)
+    )
+
+    assert result == png
+    assert len(commands) == 2
+    render_command, render_wait = commands[0]
+    cleanup_command, cleanup_wait = commands[1]
+    assert "timeout 180s" in render_command
+    assert "@mermaid-js/mermaid-cli@11.16.0" in render_command
+    assert "-t neutral -b white -w 900 -s 2" in render_command
+    assert "find /home/user -maxdepth 1" in render_command
+    assert "chmod 644 /home/user/openwebui-mermaid-" in render_command
+    assert "flowchart LR" not in render_command
+    assert render_wait == 195
+    assert cleanup_command.startswith("rm -f ")
+    assert "/home/user/openwebui-mermaid-" in cleanup_command
+    assert cleanup_wait == 10
+    assert downloads[0][1].startswith("/home/user/openwebui-mermaid-")
+    assert downloads[0][1].endswith(".png")
+    assert downloads[0][2:] == (Tools._MAX_DIAGRAM_BYTES, "Mermaid diagram")
+
+
+def test_mermaid_renderer_retains_png_and_reports_retrieval_stage(monkeypatch):
+    commands = []
+
+    async def fake_run(self, terminal, command, wait_seconds):
+        commands.append(command)
+        return {"status": "done", "exit_code": 0}
+
+    def fake_download(self, terminal, path, max_bytes, label):
+        raise urllib.error.HTTPError(
+            "http://terminal/files/view", 404, "Not Found", {}, None
+        )
+
+    monkeypatch.setattr(Tools, "_run_terminal_command", fake_run)
+    monkeypatch.setattr(Tools, "_download_terminal_path", fake_download)
+    terminal = TerminalContext("http://terminal", {"X-User-Id": "user-1"}, "/home/user")
+
+    with pytest.raises(ValueError, match=r"PNG retrieval failed \(HTTP 404\)") as exc:
+        asyncio.run(
+            configured_tools()._render_mermaid_png(
+                "flowchart LR\nA --> B", 1, terminal
+            )
+        )
+
+    retained_path = str(exc.value).split("retained at ", 1)[1].rstrip(".")
+    assert retained_path.startswith("/home/user/openwebui-mermaid-")
+    assert commands[-1].startswith("rm -f ")
+    assert retained_path not in commands[-1]
+
+
+def test_terminal_http_error_detail_is_bounded_and_safe():
+    error = urllib.error.HTTPError(
+        "http://terminal/execute",
+        404,
+        "Not Found",
+        {},
+        __import__("io").BytesIO(b'{"detail": "route not found"}'),
+    )
+
+    assert Tools._terminal_http_error_detail(error) == (
+        ' Open Terminal response: {"detail": "route not found"}'
+    )
+
+
+def test_mermaid_renderer_resolves_terminal_home_before_creating_files(monkeypatch):
+    captured = {}
+
+    def fake_request(self, url, headers, method, payload, timeout):
+        captured.update(
+            {
+                "url": url,
+                "headers": headers,
+                "method": method,
+                "payload": payload,
+                "timeout": timeout,
+            }
+        )
+        return {"cwd": "/home/user/projects/current", "home": "/home/user"}
+
+    monkeypatch.setattr(Tools, "_request_terminal_json", fake_request)
+    terminal = TerminalContext(
+        "http://terminal/api/", {"Authorization": "Bearer secret"}
+    )
+    home = asyncio.run(configured_tools()._get_terminal_home(terminal))
+
+    assert home == "/home/user"
+    assert captured == {
+        "url": "http://terminal/api/files/cwd",
+        "headers": terminal.headers,
+        "method": "GET",
+        "payload": None,
+        "timeout": 15,
+    }
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (
+            [{"type": "stderr", "data": "/bin/sh: 1: npx: not found"}],
+            "Node.js or npx is unavailable",
+        ),
+        (
+            [{"type": "stderr", "data": "Error: Could not find Chrome (ver. 123)"}],
+            "Chromium could not be installed or started",
+        ),
+        (
+            [{"type": "stderr", "data": "npm error code EAI_AGAIN"}],
+            "could not be downloaded from the network",
+        ),
+        (
+            [{"type": "stderr", "data": "Parse error on line 2"}],
+            "Mermaid rejected the diagram syntax",
+        ),
+    ],
+)
+def test_classifies_mermaid_renderer_diagnostics(output, expected):
+    assert expected in Tools._terminal_output_diagnostic(output)
+
+
+def test_terminal_command_uses_authenticated_execute_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_request(self, url, headers, method, payload, timeout):
+        captured.update(
+            {
+                "url": url,
+                "headers": headers,
+                "method": method,
+                "payload": payload,
+                "timeout": timeout,
+            }
+        )
+        return {"status": "done", "exit_code": 0}
+
+    monkeypatch.setattr(Tools, "_request_terminal_json", fake_request)
+    terminal = TerminalContext(
+        "http://terminal/api/",
+        {"Authorization": "Bearer secret", "X-User-Id": "user-1"},
+    )
+    result = asyncio.run(
+        configured_tools()._run_terminal_command(terminal, "mmdc --version", 90)
+    )
+
+    parsed = urllib.parse.urlparse(captured["url"])
+    assert parsed.path == "/api/execute"
+    assert urllib.parse.parse_qs(parsed.query) == {"wait": ["90"], "tail": ["30"]}
+    assert captured["headers"] == terminal.headers
+    assert captured["method"] == "POST"
+    assert captured["payload"] == {"command": "mmdc --version"}
+    assert captured["timeout"] == 100
+    assert result == {"status": "done", "exit_code": 0}
+
+
+def test_rejects_png_with_excessive_dimensions():
+    oversized = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + struct.pack(">II", Tools._MAX_DIAGRAM_WIDTH + 1, 100)
+    )
+    with pytest.raises(ValueError, match="too large for email"):
+        Tools._validate_png(oversized, 1)
 
 
 @pytest.mark.parametrize("user", [None, {}, {"email": "invalid"}])
