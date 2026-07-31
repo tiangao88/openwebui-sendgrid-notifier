@@ -104,7 +104,9 @@ and embeds it using a SendGrid inline CID attachment. It uses an existing `mmdc`
 binary when available; otherwise it runs the pinned
 `@mermaid-js/mermaid-cli@11.16.0` package through `npx`. The first render can take
 longer while npm and Chromium are cached, and Open Terminal must be allowed to
-reach the npm registry for that fallback.
+reach the npm registry and Chromium download host for that fallback. Temporary
+files are created using Open Terminal's reported home directory, independently
+of the current chat working directory.
 
 No new notifier valve or shared Docker volume is required. The standard Open
 Terminal image includes Node.js; minimal images without Node.js need an existing
@@ -113,13 +115,14 @@ Terminal image includes Node.js; minimal images without Node.js need an existing
 Mermaid safeguards:
 
 - At most three rendered diagrams per email
-- 90-second render timeout per diagram
+- 180-second render timeout per diagram, including first-use package setup
 - Mermaid strict security mode with HTML labels disabled
 - Fixed neutral theme, white background, 900 px base width, and 2x scaling
 - Maximum 1.5 MB per PNG and 3 MB across all inline diagrams
 - Maximum dimensions of 4,000 × 8,000 pixels
 - Automatic cleanup of source, configuration, and PNG files
 - Graceful source-code fallback when a diagram cannot be rendered
+- A bounded renderer diagnostic in the tool result and email fallback
 
 ## Delivery safeguards
 

@@ -4,7 +4,7 @@ author: Aikumi Partners
 author_url: https://aikumipartners.com
 description: Sends a Markdown email notification, optionally with Open Terminal files and rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
 required_open_webui_version: 0.11.0
-version: 1.3.0
+version: 1.3.1
 license: MIT
 """
 
@@ -31,7 +31,6 @@ from typing import Awaitable, Callable, ClassVar, NamedTuple, Optional
 import markdown
 from pydantic import BaseModel, Field
 
-
 EventEmitter = Callable[[dict], Awaitable[None]]
 
 
@@ -49,11 +48,13 @@ class EmailBody(NamedTuple):
     inline_attachments: list[EmailAttachment]
     mermaid_total: int
     mermaid_rendered: int
+    mermaid_errors: list[str]
 
 
 class TerminalContext(NamedTuple):
     base_url: str
     headers: dict[str, str]
+    home: str = ""
 
 
 class DuplicateNotificationError(Exception):
@@ -166,7 +167,11 @@ class _EmailHTMLSanitizer(HTMLParser):
         if tag in self._DANGEROUS_TAGS and self._suppressed_depth:
             self._suppressed_depth -= 1
             return
-        if self._suppressed_depth or tag not in self._ALLOWED_TAGS or tag in self._VOID_TAGS:
+        if (
+            self._suppressed_depth
+            or tag not in self._ALLOWED_TAGS
+            or tag in self._VOID_TAGS
+        ):
             return
         self._parts.append(f"</{tag}>")
 
@@ -204,7 +209,7 @@ class Tools:
     _MAX_TOTAL_DIAGRAM_BYTES: ClassVar[int] = 3_000_000
     _MAX_DIAGRAM_WIDTH: ClassVar[int] = 4_000
     _MAX_DIAGRAM_HEIGHT: ClassVar[int] = 8_000
-    _MERMAID_RENDER_TIMEOUT_SECONDS: ClassVar[int] = 90
+    _MERMAID_RENDER_TIMEOUT_SECONDS: ClassVar[int] = 180
     _MERMAID_CLI_VERSION: ClassVar[str] = "11.16.0"
     _MERMAID_FENCE_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"^```[ \t]*mermaid[ \t]*\r?\n(.*?)^```[ \t]*$",
@@ -321,7 +326,11 @@ class Tools:
                     f"{email_body.mermaid_total} Mermaid diagram(s)."
                 )
                 if failures:
-                    result += f" {failures} diagram(s) were included as source fallback."
+                    result += (
+                        f" {failures} diagram(s) were included as source fallback."
+                    )
+                    if email_body.mermaid_errors:
+                        result += f" Renderer detail: {email_body.mermaid_errors[0]}"
             return result
         except DuplicateNotificationError:
             detail = "A notification was already sent for this message; duplicate suppressed."
@@ -380,6 +389,7 @@ class Tools:
         rendered_count = 0
         terminal_context: Optional[TerminalContext] = None
         terminal_unavailable = False
+        mermaid_errors: list[str] = []
 
         if diagrams:
             await self._emit(emitter, "Rendering Mermaid diagrams…", False)
@@ -387,8 +397,9 @@ class Tools:
                 terminal_context = await self._get_open_terminal_context(
                     request, user, metadata, oauth_token
                 )
-            except ValueError:
+            except ValueError as exc:
                 terminal_unavailable = True
+                mermaid_errors.append(self._safe_mermaid_error(exc))
 
         total_inline_bytes = 0
         for index, source in enumerate(diagrams):
@@ -396,11 +407,13 @@ class Tools:
             replacement: str
             if index >= self._MAX_MERMAID_DIAGRAMS:
                 replacement = self._mermaid_fallback_html(
-                    source, "Only the first three Mermaid diagrams can be rendered per email."
+                    source,
+                    "Only the first three Mermaid diagrams can be rendered per email.",
                 )
             elif terminal_unavailable or terminal_context is None:
                 replacement = self._mermaid_fallback_html(
-                    source, "No usable system-level Open Terminal was selected for rendering."
+                    source,
+                    "No usable system-level Open Terminal was selected for rendering.",
                 )
             else:
                 try:
@@ -408,7 +421,9 @@ class Tools:
                         source, diagram_number, terminal_context
                     )
                     if total_inline_bytes + len(png) > self._MAX_TOTAL_DIAGRAM_BYTES:
-                        raise ValueError("The combined Mermaid image limit was exceeded.")
+                        raise ValueError(
+                            "The combined Mermaid image limit was exceeded."
+                        )
                     content_id = f"openwebui-mermaid-{uuid.uuid4().hex}"
                     inline_attachments.append(
                         EmailAttachment(
@@ -422,10 +437,15 @@ class Tools:
                     total_inline_bytes += len(png)
                     rendered_count += 1
                     replacement = self._mermaid_image_html(content_id, diagram_number)
-                except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
-                    replacement = self._mermaid_fallback_html(
-                        source, "The Mermaid diagram could not be rendered."
-                    )
+                except (
+                    ValueError,
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    TimeoutError,
+                ) as exc:
+                    reason = self._safe_mermaid_error(exc)
+                    mermaid_errors.append(reason)
+                    replacement = self._mermaid_fallback_html(source, reason)
 
             placeholder = f"OPENWEBUI_MERMAID_PLACEHOLDER_{index}"
             safe_html = re.sub(
@@ -438,18 +458,26 @@ class Tools:
 
         document = (
             '<!doctype html><html><body style="background:#ffffff;color:#1e293b;'
-            'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
+            "font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
             'font-size:15px;line-height:1.6;margin:0;padding:0;">'
             '<div style="box-sizing:border-box;margin:0 auto;max-width:720px;padding:28px 22px;">'
             f"{safe_html}</div></body></html>"
         )
-        return EmailBody(message, document, inline_attachments, len(diagrams), rendered_count)
+        return EmailBody(
+            message,
+            document,
+            inline_attachments,
+            len(diagrams),
+            rendered_count,
+            mermaid_errors,
+        )
 
     async def _render_mermaid_png(
         self, source: str, diagram_number: int, terminal: TerminalContext
     ) -> bytes:
         token = uuid.uuid4().hex
-        directory = ".openwebui-sendgrid-notifier"
+        home = terminal.home or await self._get_terminal_home(terminal)
+        directory = posixpath.join(home.rstrip("/"), ".openwebui-sendgrid-notifier")
         input_path = f"{directory}/mermaid-{token}.mmd"
         output_path = f"{directory}/mermaid-{token}.png"
         config_path = f"{directory}/mermaid-{token}.json"
@@ -473,13 +501,16 @@ class Tools:
             ).encode("utf-8")
         ).decode("ascii")
 
-        quoted = {name: shlex.quote(value) for name, value in {
-            "directory": directory,
-            "input": input_path,
-            "output": output_path,
-            "config": config_path,
-            "puppeteer": puppeteer_path,
-        }.items()}
+        quoted = {
+            name: shlex.quote(value)
+            for name, value in {
+                "directory": directory,
+                "input": input_path,
+                "output": output_path,
+                "config": config_path,
+                "puppeteer": puppeteer_path,
+            }.items()
+        }
         render_args = (
             f"-i {quoted['input']} -o {quoted['output']} -c {quoted['config']} "
             f"-p {quoted['puppeteer']} -t neutral -b white -w 900 -s 2"
@@ -498,11 +529,8 @@ class Tools:
             f"@mermaid-js/mermaid-cli@{self._MERMAID_CLI_VERSION} {render_args}\n"
             "fi"
         )
-        cleanup_command = (
-            "rm -f "
-            + " ".join(
-                [quoted["input"], quoted["output"], quoted["config"], quoted["puppeteer"]]
-            )
+        cleanup_command = "rm -f " + " ".join(
+            [quoted["input"], quoted["output"], quoted["config"], quoted["puppeteer"]]
         )
 
         try:
@@ -521,16 +549,35 @@ class Tools:
         finally:
             try:
                 await self._run_terminal_command(terminal, cleanup_command, 10)
-            except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            except (
+                ValueError,
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+            ):
                 pass
+
+    async def _get_terminal_home(self, terminal: TerminalContext) -> str:
+        url = f"{terminal.base_url.rstrip('/')}/files/cwd"
+        result = await asyncio.to_thread(
+            self._request_terminal_json,
+            url,
+            terminal.headers,
+            "GET",
+            None,
+            15,
+        )
+        home = str(result.get("home") or "").strip()
+        if not home or not home.startswith("/"):
+            raise ValueError("Open Terminal did not return a valid home directory.")
+        return posixpath.normpath(home)
 
     async def _run_terminal_command(
         self, terminal: TerminalContext, command: str, wait_seconds: int
     ) -> dict:
         query_wait = min(max(wait_seconds, 1), 300)
-        url = (
-            f"{terminal.base_url.rstrip('/')}/execute?"
-            + urllib.parse.urlencode({"wait": query_wait, "tail": 30})
+        url = f"{terminal.base_url.rstrip('/')}/execute?" + urllib.parse.urlencode(
+            {"wait": query_wait, "tail": 30}
         )
         result = await asyncio.to_thread(
             self._request_terminal_json,
@@ -541,10 +588,89 @@ class Tools:
             query_wait + 10,
         )
         if result.get("status") == "running":
-            raise TimeoutError("Open Terminal did not finish the command in time.")
+            raise TimeoutError("Mermaid rendering timed out in Open Terminal.")
         if result.get("exit_code") != 0:
-            raise ValueError("Open Terminal could not render the Mermaid diagram.")
+            diagnostic = self._terminal_output_diagnostic(result.get("output"))
+            detail = "Open Terminal could not render the Mermaid diagram."
+            if diagnostic:
+                detail += f" {diagnostic}"
+            raise ValueError(detail)
         return result
+
+    @classmethod
+    def _terminal_output_diagnostic(cls, output) -> str:
+        parts: list[str] = []
+
+        def collect(value) -> None:
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for key in ("data", "content", "text", "message", "stderr", "stdout"):
+                    if key in value:
+                        collect(value[key])
+                        break
+
+        collect(output)
+        text = " ".join(parts)
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        text = " ".join(text.split())
+        if not text:
+            return ""
+
+        lowered = text.casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "npx: not found",
+                "npx: command not found",
+                "command not found: npx",
+                "node: not found",
+                "node: command not found",
+                "command not found: node",
+            )
+        ):
+            return "Node.js or npx is unavailable in the selected Open Terminal image."
+        if any(
+            marker in lowered
+            for marker in (
+                "could not find chrome",
+                "could not find chromium",
+                "failed to launch the browser",
+                "browser was not found",
+                "no usable sandbox",
+            )
+        ):
+            return "Chromium could not be installed or started in Open Terminal."
+        if any(
+            marker in lowered
+            for marker in (
+                "eai_again",
+                "enotfound",
+                "econnreset",
+                "network request failed",
+                "npm error network",
+            )
+        ):
+            return "Mermaid CLI or Chromium could not be downloaded from the network."
+        if "parse error" in lowered or "syntax error" in lowered:
+            return f"Mermaid rejected the diagram syntax: {text[-400:]}"
+        return f"Open Terminal output: {text[-500:]}"
+
+    @staticmethod
+    def _safe_mermaid_error(exc: BaseException) -> str:
+        if isinstance(exc, TimeoutError):
+            return "Mermaid rendering timed out in Open Terminal."
+        if isinstance(exc, urllib.error.HTTPError):
+            return (
+                f"Open Terminal returned HTTP {exc.code} while rendering the diagram."
+            )
+        if isinstance(exc, urllib.error.URLError):
+            return "Open Terminal could not be reached while rendering the diagram."
+        detail = " ".join(str(exc).split())
+        return detail[:600] or "The Mermaid diagram could not be rendered."
 
     def _request_terminal_json(
         self,
@@ -599,7 +725,9 @@ class Tools:
             )
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                raise ValueError("The Open Terminal attachment file was not found.") from exc
+                raise ValueError(
+                    "The Open Terminal attachment file was not found."
+                ) from exc
             if exc.code in (401, 403):
                 raise ValueError(
                     "Open Terminal rejected access to the attachment file."
@@ -611,7 +739,9 @@ class Tools:
             raise ValueError("Open Terminal could not be reached.") from exc
 
         if not content_type:
-            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            content_type = (
+                mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
         return EmailAttachment(content, filename, content_type)
 
     async def _get_open_terminal_context(
@@ -671,14 +801,18 @@ class Tools:
         if auth_type == "bearer":
             api_key = str(connection.get("key") or "").strip()
             if not api_key:
-                raise ValueError("The selected Open Terminal API key is not configured.")
+                raise ValueError(
+                    "The selected Open Terminal API key is not configured."
+                )
             headers["Authorization"] = f"Bearer {api_key}"
         elif auth_type == "session":
             credentials = str(
                 getattr(getattr(request.state, "token", None), "credentials", "") or ""
             ).strip()
             if not credentials:
-                raise ValueError("The Open Terminal session credentials are unavailable.")
+                raise ValueError(
+                    "The Open Terminal session credentials are unavailable."
+                )
             headers["Authorization"] = f"Bearer {credentials}"
             cookie = request.headers.get("cookie", "")
             if cookie:
@@ -702,9 +836,8 @@ class Tools:
         max_bytes: int,
         label: str,
     ) -> tuple[bytes, str]:
-        url = (
-            f"{terminal.base_url.rstrip('/')}/files/view?"
-            + urllib.parse.urlencode({"path": path})
+        url = f"{terminal.base_url.rstrip('/')}/files/view?" + urllib.parse.urlencode(
+            {"path": path}
         )
         terminal_request = urllib.request.Request(
             url,
@@ -731,18 +864,22 @@ class Tools:
                 raise ValueError(
                     f"The {label} exceeds the {self._format_bytes(max_bytes)} size limit."
                 )
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[
-                0
-            ].strip()
+            content_type = (
+                response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+            )
             return content, content_type
 
     @classmethod
     def _validate_png(cls, content: bytes, diagram_number: int) -> None:
         if len(content) < 24 or not content.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise ValueError(f"Mermaid diagram {diagram_number} was not rendered as PNG.")
+            raise ValueError(
+                f"Mermaid diagram {diagram_number} was not rendered as PNG."
+            )
         width, height = struct.unpack(">II", content[16:24])
         if width > cls._MAX_DIAGRAM_WIDTH or height > cls._MAX_DIAGRAM_HEIGHT:
-            raise ValueError(f"Mermaid diagram {diagram_number} is too large for email.")
+            raise ValueError(
+                f"Mermaid diagram {diagram_number} is too large for email."
+            )
 
     @staticmethod
     def _mermaid_image_html(content_id: str, diagram_number: int) -> str:
@@ -761,8 +898,8 @@ class Tools:
             'margin:18px 0;padding:14px;">'
             f'<p style="color:#9a3412;font-weight:600;margin:0 0 10px;">{html.escape(reason)}</p>'
             '<pre style="background:#ffffff;border:1px solid #e2e8f0;border-radius:4px;'
-            'color:#0f172a;font-family:SFMono-Regular,Consolas,Liberation Mono,monospace;'
-            'font-size:13px;line-height:1.45;margin:0;overflow-wrap:anywhere;padding:12px;'
+            "color:#0f172a;font-family:SFMono-Regular,Consolas,Liberation Mono,monospace;"
+            "font-size:13px;line-height:1.45;margin:0;overflow-wrap:anywhere;padding:12px;"
             f'white-space:pre-wrap;">{html.escape(source)}</pre></div>'
         )
 
@@ -777,7 +914,9 @@ class Tools:
             raise ValueError("The Open Terminal attachment path must be absolute.")
 
         filename = posixpath.basename(value.rstrip("/"))
-        filename = "".join(character for character in filename if ord(character) >= 32).strip()
+        filename = "".join(
+            character for character in filename if ord(character) >= 32
+        ).strip()
         if not filename:
             raise ValueError("The attachment path must identify a file.")
         if len(filename) > 255:
@@ -788,7 +927,9 @@ class Tools:
     def _get_recipient(user: Optional[dict]) -> str:
         email = (user or {}).get("email", "").strip()
         if not email or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-            raise ValueError("The current OpenWebUI account has no valid email address.")
+            raise ValueError(
+                "The current OpenWebUI account has no valid email address."
+            )
         return email
 
     @staticmethod
@@ -955,7 +1096,9 @@ class Tools:
         )
         with urllib.request.urlopen(request, timeout=15) as response:
             if response.status != 202:
-                raise RuntimeError(f"Unexpected SendGrid response: HTTP {response.status}")
+                raise RuntimeError(
+                    f"Unexpected SendGrid response: HTTP {response.status}"
+                )
 
     @staticmethod
     def _sendgrid_error(error: urllib.error.HTTPError) -> str:
