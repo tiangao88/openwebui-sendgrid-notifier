@@ -9,6 +9,9 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
 - Uses OpenWebUI's injected `__user__["email"]` as the only recipient
 - Keeps the SendGrid API key in an admin-configured password valve
 - Sends plain-text email through SendGrid API v3
+- Optionally attaches one file from the Open Terminal selected for the chat
+- Reuses OpenWebUI's system-level Open Terminal URL, credentials, and access grants
+- Enforces a 10 MB attachment limit without passing file bytes through the LLM
 - Shows in-chat progress and error notifications
 - Suppresses repeated sends from the same OpenWebUI message for 24 hours
 - Limits each user to one successful notification every 10 minutes by default
@@ -28,6 +31,11 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
      set to `0` to disable the cooldown
 5. Enable the tool for the desired model or select it in a chat.
 
+No additional Open Terminal valves are required. Configure Open Terminal once in
+**Admin Settings → Integrations → Open Terminal**. When an attachment is
+requested, the tool uses the terminal selected for the current chat and reads its
+connection from OpenWebUI's own `terminal_server.connections` configuration.
+
 The sender address is configurable because SendGrid requires a verified sender.
 The recipient is deliberately not configurable.
 
@@ -38,6 +46,8 @@ Add this to the model's system prompt if you want conservative tool use:
 > Use `send_email_notification` only when the user explicitly asks for an email
 > notification. Briefly confirm the subject and notification content before calling
 > it. The recipient is automatically the current user's OpenWebUI account email.
+> To attach a generated Open Terminal file, pass its absolute path as
+> `attachment_path`. Never attach a file unless the user explicitly requests it.
 
 ## Tool arguments
 
@@ -45,8 +55,24 @@ Add this to the model's system prompt if you want conservative tool use:
 |---|---|
 | `subject` | Email subject, maximum 200 characters |
 | `message` | Plain-text email body, maximum 50,000 characters |
+| `attachment_path` | Optional absolute path to one file in the Open Terminal selected for the chat; maximum file size 10 MB |
 
 There is intentionally no `to`, `recipient`, `cc`, or `bcc` argument.
+
+## Open Terminal attachment flow
+
+1. The model creates or modifies a file with Open Terminal.
+2. The model calls `send_email_notification` with the file's absolute path.
+3. The notifier reads the active `terminal_id` injected by OpenWebUI.
+4. It loads that system-level connection from OpenWebUI, checks the current user's
+   access grants, and sends the user's ID and chat session ID to Open Terminal.
+5. It downloads the file directly from `/files/view`, Base64-encodes it outside the
+   model context, and adds it to the SendGrid request.
+
+This works with terminals configured by an administrator under OpenWebUI's
+system-level integrations. A direct terminal configured only in an individual
+user's browser settings cannot be used because its URL and credentials are not
+available to server-side Workspace Tools.
 
 ## Delivery safeguards
 
@@ -81,6 +107,10 @@ Tests mock the SendGrid endpoint and never send real email.
   all tool code before installing it.
 - Give the SendGrid key only **Mail Send** permission.
 - Restrict tool availability if users should not be able to trigger notifications.
+- Attachment access is limited to the Open Terminal selected for the chat and is
+  checked against the same system connection access grants as OpenWebUI.
+- The tool depends on OpenWebUI's current internal configuration API. Re-test
+  attachments after major OpenWebUI upgrades.
 - SendGrid may still enforce account, sender-verification, and rate limits.
 
 ## License

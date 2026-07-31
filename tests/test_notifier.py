@@ -1,10 +1,15 @@
 import asyncio
+import base64
 import json
+import sys
+import types
 import urllib.error
+import urllib.parse
+from types import SimpleNamespace
 
 import pytest
 
-from openwebui_sendgrid_notifier import Tools
+from openwebui_sendgrid_notifier import EmailAttachment, Tools
 
 
 class Response:
@@ -61,6 +66,201 @@ def test_sends_only_to_authenticated_user(monkeypatch):
         {"to": [{"email": "stephan@example.org"}]}
     ]
     assert captured["payload"]["subject"] == "Report ready"
+    assert "attachments" not in captured["payload"]
+
+
+def test_sends_file_from_selected_open_terminal(monkeypatch):
+    captured = {}
+
+    async def fake_get_attachment(
+        self, path, request, user, metadata, oauth_token
+    ):
+        captured["attachment_request"] = {
+            "path": path,
+            "request": request,
+            "user": user,
+            "metadata": metadata,
+            "oauth_token": oauth_token,
+        }
+        return EmailAttachment(b"report,data\n", "report.csv", "text/csv")
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr(Tools, "_get_open_terminal_attachment", fake_get_attachment)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    request_context = object()
+    user = {"id": "user-1", "email": "stephan@example.org"}
+    metadata = {"terminal_id": "terminal-1", "chat_id": "chat-1"}
+
+    result = asyncio.run(
+        configured_tools().send_email_notification(
+            "Report ready",
+            "The report is attached.",
+            attachment_path="/home/user/report.csv",
+            __user__=user,
+            __metadata__=metadata,
+            __request__=request_context,
+        )
+    )
+
+    assert "sent successfully" in result
+    assert captured["attachment_request"] == {
+        "path": "/home/user/report.csv",
+        "request": request_context,
+        "user": user,
+        "metadata": metadata,
+        "oauth_token": None,
+    }
+    assert captured["payload"]["attachments"] == [
+        {
+            "content": base64.b64encode(b"report,data\n").decode("ascii"),
+            "type": "text/csv",
+            "filename": "report.csv",
+            "disposition": "attachment",
+        }
+    ]
+
+
+def test_attachment_requires_selected_system_terminal(monkeypatch):
+    called = False
+
+    def fake_urlopen(request, timeout):
+        nonlocal called
+        called = True
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = asyncio.run(
+        configured_tools().send_email_notification(
+            "Report ready",
+            "The report is attached.",
+            attachment_path="/home/user/report.csv",
+            __user__={"id": "user-1", "email": "stephan@example.org"},
+            __metadata__={},
+            __request__=object(),
+        )
+    )
+
+    assert "No system-level Open Terminal connection is selected" in result
+    assert called is False
+
+
+def test_reads_selected_terminal_from_openwebui_configuration(monkeypatch):
+    captured = {}
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key, default):
+            assert key == "terminal_server.connections"
+            return [
+                {
+                    "id": "terminal-1",
+                    "enabled": True,
+                    "url": "http://open-terminal:8000",
+                    "key": "terminal-secret",
+                    "auth_type": "bearer",
+                    "config": {
+                        "access_grants": [
+                            {
+                                "principal_type": "user",
+                                "principal_id": "user-1",
+                                "permission": "read",
+                            }
+                        ]
+                    },
+                }
+            ]
+
+    async def fake_has_connection_access(user, connection):
+        captured["access_user"] = user
+        captured["access_connection"] = connection
+        return True
+
+    class TerminalResponse:
+        headers = {"Content-Length": "4", "Content-Type": "text/csv; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit):
+            captured["read_limit"] = limit
+            return b"a,b\n"
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.headers)
+        captured["timeout"] = timeout
+        return TerminalResponse()
+
+    module_map = {
+        "open_webui": types.ModuleType("open_webui"),
+        "open_webui.models": types.ModuleType("open_webui.models"),
+        "open_webui.models.config": types.ModuleType("open_webui.models.config"),
+        "open_webui.utils": types.ModuleType("open_webui.utils"),
+        "open_webui.utils.access_control": types.ModuleType(
+            "open_webui.utils.access_control"
+        ),
+        "open_webui.utils.terminals": types.ModuleType("open_webui.utils.terminals"),
+    }
+    module_map["open_webui.models.config"].Config = FakeConfig
+    module_map[
+        "open_webui.utils.access_control"
+    ].has_connection_access = fake_has_connection_access
+    module_map["open_webui.utils.terminals"].get_terminal_server_url = (
+        lambda connection: connection["url"]
+    )
+    for name, module in module_map.items():
+        if name in ("open_webui", "open_webui.models", "open_webui.utils"):
+            module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    request_context = SimpleNamespace(state=SimpleNamespace(), headers={})
+    attachment = asyncio.run(
+        configured_tools()._get_open_terminal_attachment(
+            "/home/user/report.csv",
+            request_context,
+            {"id": "user-1", "role": "user"},
+            {"terminal_id": "terminal-1", "chat_id": "chat-1"},
+            None,
+        )
+    )
+
+    assert attachment == EmailAttachment(b"a,b\n", "report.csv", "text/csv")
+    parsed_url = urllib.parse.urlparse(captured["url"])
+    assert parsed_url.path == "/files/view"
+    assert urllib.parse.parse_qs(parsed_url.query) == {
+        "path": ["/home/user/report.csv"]
+    }
+    assert captured["headers"]["Authorization"] == "Bearer terminal-secret"
+    assert captured["headers"]["X-user-id"] == "user-1"
+    assert captured["headers"]["X-session-id"] == "chat-1"
+    assert captured["timeout"] == 30
+    assert captured["read_limit"] == Tools._MAX_ATTACHMENT_BYTES + 1
+    assert captured["access_user"].id == "user-1"
+
+
+def test_rejects_oversized_terminal_attachment(monkeypatch):
+    class OversizedResponse:
+        headers = {"Content-Length": str(Tools._MAX_ATTACHMENT_BYTES + 1)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda request, timeout: OversizedResponse()
+    )
+
+    with pytest.raises(ValueError, match="exceeds the 10 MB"):
+        configured_tools()._download_terminal_file("http://terminal/file", {})
 
 
 @pytest.mark.parametrize("user", [None, {}, {"email": "invalid"}])

@@ -2,26 +2,37 @@
 title: SendGrid Email Notification
 author: Aikumi Partners
 author_url: https://aikumipartners.com
-description: Sends an email notification to the current OpenWebUI user's account email through SendGrid.
-required_open_webui_version: 0.6.0
-version: 1.1.0
+description: Sends an email notification, optionally with an Open Terminal attachment, to the current OpenWebUI user's account email through SendGrid.
+required_open_webui_version: 0.11.0
+version: 1.2.0
 license: MIT
 """
 
 import asyncio
+import base64
 import json
 import math
+import mimetypes
+import posixpath
 import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Awaitable, Callable, ClassVar, Optional
+from types import SimpleNamespace
+from typing import Awaitable, Callable, ClassVar, NamedTuple, Optional
 
 from pydantic import BaseModel, Field
 
 
 EventEmitter = Callable[[dict], Awaitable[None]]
+
+
+class EmailAttachment(NamedTuple):
+    content: bytes
+    filename: str
+    content_type: str
 
 
 class DuplicateNotificationError(Exception):
@@ -45,6 +56,7 @@ class Tools:
     _inflight_users: ClassVar[set[str]] = set()
     _inflight_message_ids: ClassVar[set[tuple[str, str]]] = set()
     _IDEMPOTENCY_TTL_SECONDS: ClassVar[int] = 24 * 60 * 60
+    _MAX_ATTACHMENT_BYTES: ClassVar[int] = 10 * 1024 * 1024
 
     class Valves(BaseModel):
         SENDGRID_API_KEY: str = Field(
@@ -77,8 +89,12 @@ class Tools:
         self,
         subject: str,
         message: str,
+        attachment_path: str = "",
         __user__: Optional[dict] = None,
         __message_id__: Optional[str] = None,
+        __metadata__: Optional[dict] = None,
+        __request__=None,
+        __oauth_token__: Optional[dict] = None,
         __event_emitter__: Optional[EventEmitter] = None,
     ) -> str:
         """
@@ -89,6 +105,7 @@ class Tools:
 
         :param subject: Short, descriptive email subject.
         :param message: Plain-text notification body. Include all information the user needs.
+        :param attachment_path: Optional absolute path to one file in the Open Terminal selected for this chat. Leave empty for no attachment.
         :return: A delivery confirmation or a safe error message.
         """
         try:
@@ -101,10 +118,29 @@ class Tools:
 
             reservation = self._reserve_delivery(user_key, message_id)
 
-            await self._emit(__event_emitter__, "Sending email notification…", False)
             try:
+                attachment = None
+                if attachment_path.strip():
+                    await self._emit(
+                        __event_emitter__, "Retrieving Open Terminal attachment…", False
+                    )
+                    attachment = await self._get_open_terminal_attachment(
+                        attachment_path,
+                        __request__,
+                        __user__,
+                        __metadata__,
+                        __oauth_token__,
+                    )
+
+                await self._emit(
+                    __event_emitter__, "Sending email notification…", False
+                )
                 await asyncio.to_thread(
-                    self._send_via_sendgrid, recipient, subject, message
+                    self._send_via_sendgrid,
+                    recipient,
+                    subject,
+                    message,
+                    attachment,
                 )
             except BaseException:
                 self._release_delivery(reservation)
@@ -133,6 +169,161 @@ class Tools:
             detail = "SendGrid could not be reached. Try again later."
             await self._emit(__event_emitter__, detail, True, "error")
             return f"Email notification was not sent: {detail}"
+
+    async def _get_open_terminal_attachment(
+        self,
+        attachment_path: str,
+        request,
+        user: Optional[dict],
+        metadata: Optional[dict],
+        oauth_token: Optional[dict],
+    ) -> EmailAttachment:
+        path, filename = self._clean_attachment_path(attachment_path)
+        terminal_id = str((metadata or {}).get("terminal_id") or "").strip()
+        if not terminal_id:
+            raise ValueError(
+                "No system-level Open Terminal connection is selected for this chat."
+            )
+        if request is None:
+            raise ValueError("OpenWebUI did not provide the request context.")
+
+        try:
+            from open_webui.models.config import Config
+            from open_webui.utils.access_control import has_connection_access
+            from open_webui.utils.terminals import get_terminal_server_url
+        except ImportError as exc:
+            raise ValueError(
+                "This OpenWebUI version does not expose its Open Terminal configuration to tools."
+            ) from exc
+
+        connections = await Config.get("terminal_server.connections", []) or []
+        connection = next(
+            (item for item in connections if item.get("id") == terminal_id), None
+        )
+        if connection is None:
+            raise ValueError("The selected Open Terminal connection was not found.")
+        if not connection.get("enabled", True):
+            raise ValueError("The selected Open Terminal connection is disabled.")
+
+        user_id = str((user or {}).get("id") or "").strip()
+        user_role = str((user or {}).get("role") or "user").strip()
+        if not user_id:
+            raise ValueError("The current OpenWebUI user has no valid user ID.")
+
+        openwebui_user = SimpleNamespace(id=user_id, role=user_role)
+        if not await has_connection_access(openwebui_user, connection):
+            raise ValueError(
+                "The current user cannot access the selected Open Terminal connection."
+            )
+
+        base_url = get_terminal_server_url(connection)
+        if not base_url:
+            raise ValueError("The selected Open Terminal URL is not configured.")
+
+        headers = {"X-User-Id": user_id}
+        chat_id = str((metadata or {}).get("chat_id") or "").strip()
+        if chat_id:
+            headers["X-Session-Id"] = chat_id
+
+        auth_type = connection.get("auth_type", "bearer")
+        if auth_type == "bearer":
+            api_key = str(connection.get("key") or "").strip()
+            if not api_key:
+                raise ValueError("The selected Open Terminal API key is not configured.")
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif auth_type == "session":
+            credentials = str(
+                getattr(getattr(request.state, "token", None), "credentials", "")
+                or ""
+            ).strip()
+            if not credentials:
+                raise ValueError("The Open Terminal session credentials are unavailable.")
+            headers["Authorization"] = f"Bearer {credentials}"
+            cookie = request.headers.get("cookie", "")
+            if cookie:
+                headers["Cookie"] = cookie
+        elif auth_type == "system_oauth":
+            access_token = str((oauth_token or {}).get("access_token") or "").strip()
+            if not access_token:
+                raise ValueError("The Open Terminal OAuth credentials are unavailable.")
+            headers["Authorization"] = f"Bearer {access_token}"
+        elif auth_type != "none":
+            raise ValueError(
+                f"Open Terminal authentication type '{auth_type}' is not supported."
+            )
+
+        url = f"{base_url.rstrip('/')}/files/view?{urllib.parse.urlencode({'path': path})}"
+        try:
+            content, content_type = await asyncio.to_thread(
+                self._download_terminal_file, url, headers
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise ValueError("The Open Terminal attachment file was not found.") from exc
+            if exc.code in (401, 403):
+                raise ValueError(
+                    "Open Terminal rejected access to the attachment file."
+                ) from exc
+            raise ValueError(
+                f"Open Terminal could not return the attachment (HTTP {exc.code})."
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise ValueError("Open Terminal could not be reached.") from exc
+
+        if not content_type:
+            content_type = (
+                mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
+        return EmailAttachment(content, filename, content_type)
+
+    def _download_terminal_file(
+        self, url: str, headers: dict[str, str]
+    ) -> tuple[bytes, str]:
+        terminal_request = urllib.request.Request(
+            url,
+            headers={**headers, "User-Agent": "openwebui-sendgrid-notifier/1.2"},
+            method="GET",
+        )
+        with urllib.request.urlopen(terminal_request, timeout=30) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    reported_size = int(content_length)
+                except (TypeError, ValueError):
+                    reported_size = None
+                if (
+                    reported_size is not None
+                    and reported_size > self._MAX_ATTACHMENT_BYTES
+                ):
+                    raise ValueError("The attachment exceeds the 10 MB size limit.")
+
+            content = response.read(self._MAX_ATTACHMENT_BYTES + 1)
+            if len(content) > self._MAX_ATTACHMENT_BYTES:
+                raise ValueError("The attachment exceeds the 10 MB size limit.")
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[
+                0
+            ].strip()
+            return content, content_type
+
+    @staticmethod
+    def _clean_attachment_path(path: str) -> tuple[str, str]:
+        value = path.strip()
+        if not value:
+            raise ValueError("The attachment path cannot be empty.")
+        if len(value) > 4_096 or "\x00" in value:
+            raise ValueError("The attachment path is invalid.")
+        if not value.startswith("/"):
+            raise ValueError("The Open Terminal attachment path must be absolute.")
+
+        filename = posixpath.basename(value.rstrip("/"))
+        filename = "".join(
+            character for character in filename if ord(character) >= 32
+        ).strip()
+        if not filename:
+            raise ValueError("The attachment path must identify a file.")
+        if len(filename) > 255:
+            filename = filename[:255]
+        return value, filename
 
     @staticmethod
     def _get_recipient(user: Optional[dict]) -> str:
@@ -252,7 +443,13 @@ class Tools:
             raise ValueError("The email message must be 50,000 characters or fewer.")
         return value
 
-    def _send_via_sendgrid(self, recipient: str, subject: str, message: str) -> None:
+    def _send_via_sendgrid(
+        self,
+        recipient: str,
+        subject: str,
+        message: str,
+        attachment: Optional[EmailAttachment] = None,
+    ) -> None:
         payload = {
             "personalizations": [{"to": [{"email": recipient}]}],
             "from": {
@@ -262,13 +459,22 @@ class Tools:
             "subject": subject,
             "content": [{"type": "text/plain", "value": message}],
         }
+        if attachment:
+            payload["attachments"] = [
+                {
+                    "content": base64.b64encode(attachment.content).decode("ascii"),
+                    "type": attachment.content_type,
+                    "filename": attachment.filename,
+                    "disposition": "attachment",
+                }
+            ]
         request = urllib.request.Request(
             "https://api.sendgrid.com/v3/mail/send",
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.valves.SENDGRID_API_KEY.strip()}",
                 "Content-Type": "application/json",
-                "User-Agent": "openwebui-sendgrid-notifier/1.1",
+                "User-Agent": "openwebui-sendgrid-notifier/1.2",
             },
             method="POST",
         )

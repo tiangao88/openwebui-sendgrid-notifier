@@ -1,7 +1,7 @@
 [project]
 name = "openwebui-sendgrid-notifier"
-version = "1.1.0"
-description = "An OpenWebUI tool that sends SendGrid notifications to the current user's account email."
+version = "1.2.0"
+description = "An OpenWebUI tool that sends SendGrid notifications and Open Terminal attachments to the current user's account email."
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.0"]
 
