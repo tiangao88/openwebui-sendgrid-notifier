@@ -31,6 +31,39 @@ def configured_tools() -> Tools:
     return tools
 
 
+def install_openwebui_terminal_modules(monkeypatch, connections, access):
+    class FakeConfig:
+        @staticmethod
+        async def get(key, default):
+            assert key == "terminal_server.connections"
+            return connections
+
+    async def fake_has_connection_access(user, connection):
+        return access(connection)
+
+    module_map = {
+        "open_webui": types.ModuleType("open_webui"),
+        "open_webui.models": types.ModuleType("open_webui.models"),
+        "open_webui.models.config": types.ModuleType("open_webui.models.config"),
+        "open_webui.utils": types.ModuleType("open_webui.utils"),
+        "open_webui.utils.access_control": types.ModuleType(
+            "open_webui.utils.access_control"
+        ),
+        "open_webui.utils.terminals": types.ModuleType("open_webui.utils.terminals"),
+    }
+    module_map["open_webui.models.config"].Config = FakeConfig
+    module_map["open_webui.utils.access_control"].has_connection_access = (
+        fake_has_connection_access
+    )
+    module_map["open_webui.utils.terminals"].get_terminal_server_url = (
+        lambda connection: connection["url"]
+    )
+    for name, module in module_map.items():
+        if name in ("open_webui", "open_webui.models", "open_webui.utils"):
+            module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+
 @pytest.fixture(autouse=True)
 def reset_delivery_state():
     with Tools._state_lock:
@@ -128,7 +161,7 @@ def test_sends_file_from_selected_open_terminal(monkeypatch):
     ]
 
 
-def test_attachment_requires_selected_system_terminal(monkeypatch):
+def test_attachment_requires_accessible_system_terminal(monkeypatch):
     called = False
 
     def fake_urlopen(request, timeout):
@@ -137,6 +170,7 @@ def test_attachment_requires_selected_system_terminal(monkeypatch):
         return Response()
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    install_openwebui_terminal_modules(monkeypatch, [], lambda item: False)
     result = asyncio.run(
         configured_tools().send_email_notification(
             "Report ready",
@@ -148,8 +182,144 @@ def test_attachment_requires_selected_system_terminal(monkeypatch):
         )
     )
 
-    assert "No system-level Open Terminal connection is selected" in result
+    assert "No accessible system-level Open Terminal connection is available" in result
     assert called is False
+
+
+def test_tool_uses_configured_terminal_id_without_chat_selection(monkeypatch):
+    connections = [
+        {
+            "id": "terminal-1",
+            "name": "OtherCloud",
+            "enabled": True,
+            "url": "http://other-terminal:8000",
+            "auth_type": "none",
+        },
+        {
+            "id": "terminal-2",
+            "name": "MyCloud",
+            "enabled": True,
+            "url": "http://mycloud:8000",
+            "key": "mycloud-secret",
+            "auth_type": "bearer",
+        },
+    ]
+    install_openwebui_terminal_modules(monkeypatch, connections, lambda item: True)
+    tools = configured_tools()
+    tools.valves.OPEN_TERMINAL_CONNECTION = "terminal-2"
+    request = SimpleNamespace(state=SimpleNamespace(), headers={})
+
+    context = asyncio.run(
+        tools._get_open_terminal_context(
+            request,
+            {"id": "user-1", "role": "user"},
+            {"chat_id": "chat-1"},
+            None,
+        )
+    )
+
+    assert context.base_url == "http://mycloud:8000"
+    assert context.headers["Authorization"] == "Bearer mycloud-secret"
+    assert context.headers["X-Session-Id"] == "chat-1"
+
+
+def test_chat_terminal_selection_takes_precedence_over_tool_valve(monkeypatch):
+    connections = [
+        {
+            "id": "terminal-1",
+            "name": "AttachedCloud",
+            "enabled": True,
+            "url": "http://attached:8000",
+            "auth_type": "none",
+        },
+        {
+            "id": "terminal-2",
+            "name": "ConfiguredCloud",
+            "enabled": True,
+            "url": "http://configured:8000",
+            "auth_type": "none",
+        },
+    ]
+    install_openwebui_terminal_modules(monkeypatch, connections, lambda item: True)
+    tools = configured_tools()
+    tools.valves.OPEN_TERMINAL_CONNECTION = "terminal-2"
+    request = SimpleNamespace(state=SimpleNamespace(), headers={})
+
+    context = asyncio.run(
+        tools._get_open_terminal_context(
+            request,
+            {"id": "user-1", "role": "user"},
+            {"terminal_id": "terminal-1", "chat_id": "chat-1"},
+            None,
+        )
+    )
+
+    assert context.base_url == "http://attached:8000"
+
+
+def test_tool_automatically_uses_only_accessible_terminal(monkeypatch):
+    connections = [
+        {
+            "id": "terminal-1",
+            "name": "OtherCloud",
+            "enabled": True,
+            "url": "http://other:8000",
+            "auth_type": "none",
+        },
+        {
+            "id": "terminal-2",
+            "name": "MyCloud",
+            "enabled": True,
+            "url": "http://mycloud:8000",
+            "auth_type": "none",
+        },
+    ]
+    install_openwebui_terminal_modules(
+        monkeypatch,
+        connections,
+        lambda item: item["id"] == "terminal-2",
+    )
+    request = SimpleNamespace(state=SimpleNamespace(), headers={})
+
+    context = asyncio.run(
+        configured_tools()._get_open_terminal_context(
+            request,
+            {"id": "user-1", "role": "user"},
+            {},
+            None,
+        )
+    )
+
+    assert context.base_url == "http://mycloud:8000"
+
+
+def test_tool_requires_selector_when_several_terminals_are_accessible(monkeypatch):
+    connections = [
+        {
+            "id": "terminal-1",
+            "enabled": True,
+            "url": "http://one:8000",
+            "auth_type": "none",
+        },
+        {
+            "id": "terminal-2",
+            "enabled": True,
+            "url": "http://two:8000",
+            "auth_type": "none",
+        },
+    ]
+    install_openwebui_terminal_modules(monkeypatch, connections, lambda item: True)
+    request = SimpleNamespace(state=SimpleNamespace(), headers={})
+
+    with pytest.raises(ValueError, match="OPEN_TERMINAL_CONNECTION Tool valve"):
+        asyncio.run(
+            configured_tools()._get_open_terminal_context(
+                request,
+                {"id": "user-1", "role": "user"},
+                {},
+                None,
+            )
+        )
 
 
 def test_reads_selected_terminal_from_openwebui_configuration(monkeypatch):
