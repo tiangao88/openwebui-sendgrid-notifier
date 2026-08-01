@@ -17,7 +17,7 @@ is locked to the authenticated OpenWebUI user's account email.
 - Converts Markdown headings, emphasis, lists, links, code blocks, and tables
 - Sanitizes generated HTML with a conservative tag and URL allowlist
 - Renders up to three Mermaid code blocks as inline PNG images through Open Terminal
-- Optionally attaches one file from the Open Terminal selected for the chat
+- Optionally attaches one file from the resolved Open Terminal
 - Reuses OpenWebUI's system-level Open Terminal URL, credentials, and access grants
 - Enforces a 10 MB attachment limit without passing file bytes through the LLM
 - Shows in-chat progress and error notifications
@@ -37,6 +37,10 @@ is locked to the authenticated OpenWebUI user's account email.
    - `SENDER_NAME`: the display name recipients will see
    - `RATE_LIMIT_MINUTES`: minimum delay per user; defaults to `10` and can be
      set to `0` to disable the cooldown
+   - `OPEN_TERMINAL_CONNECTION`: optional internal connection ID from **Admin
+     Settings → Integrations → Open Terminal**. When configured, the Tool can
+     render Mermaid and retrieve files even when no terminal is attached to the
+     chat. The ID is preferred over the display name.
 5. Enable the tool for the desired model or select it in a chat.
 
 ## Install the message Action
@@ -70,13 +74,11 @@ content arrays, and Responses API `output_text` blocks. Non-text parts and hidde
 reasoning blocks are not emailed.
 
 No additional Open Terminal URL or credential valves are required. Configure Open
-Terminal once in **Admin Settings → Integrations → Open Terminal**. When an
-attachment is requested, the Tool uses the terminal selected for the current chat.
-For Mermaid rendering, the Action uses its optional connection selector only when
-more than one accessible system terminal exists. Use the connection's internal ID
-from **Admin Settings → Integrations → Open Terminal**. A unique display name is
-also accepted for compatibility, but the immutable ID is more reliable. Both
-plugins read the URL and credentials from OpenWebUI's own configuration.
+Terminal once in **Admin Settings → Integrations → Open Terminal**. Both plugins
+accept an optional `OPEN_TERMINAL_CONNECTION` selector. Use the connection's
+internal ID; a unique display name is also accepted for compatibility. The
+immutable ID is more reliable. Both plugins read the URL and credentials from
+OpenWebUI's own configuration and enforce the current user's access grants.
 
 The sender address is configurable because SendGrid requires a verified sender.
 The recipient is deliberately not configurable.
@@ -99,7 +101,7 @@ Add this to the model's system prompt if you want conservative tool use:
 |---|---|
 | `subject` | Email subject, maximum 200 characters |
 | `message` | Markdown email body, maximum 50,000 characters |
-| `attachment_path` | Optional absolute path to one file in the Open Terminal selected for the chat; maximum file size 10 MB |
+| `attachment_path` | Optional absolute path to one file in the resolved Open Terminal; maximum file size 10 MB |
 
 There is intentionally no `to`, `recipient`, `cc`, or `bcc` argument.
 
@@ -107,7 +109,8 @@ There is intentionally no `to`, `recipient`, `cc`, or `bcc` argument.
 
 1. The model creates or modifies a file with Open Terminal.
 2. The model calls `send_email_notification` with the file's absolute path.
-3. The notifier reads the active `terminal_id` injected by OpenWebUI.
+3. The notifier resolves the terminal from the chat selection, the Tool valve, or
+   the only accessible connection, in that order.
 4. It loads that system-level connection from OpenWebUI, checks the current user's
    access grants, and sends the user's ID and chat session ID to Open Terminal.
 5. It downloads the file directly from `/files/view`, Base64-encodes it outside the
@@ -143,13 +146,16 @@ and embeds it using a SendGrid inline CID attachment. It uses an existing `mmdc`
 binary when available; otherwise it runs the pinned
 `@mermaid-js/mermaid-cli@11.16.0` package through `npx`.
 
-The Tool uses the Open Terminal selected in the chat. OpenWebUI v0.11 Action
-payloads do not include that selection, so the Action automatically uses the only
-enabled system terminal accessible to the current user. If several are accessible,
-set the Action's `OPEN_TERMINAL_CONNECTION` valve to the intended connection's
-internal ID, available in **Admin Settings → Integrations → Open Terminal**. A
-unique connection name remains supported as a fallback. Access control is checked
-before every render.
+The Tool first uses the Open Terminal selected in the chat. If none is selected,
+it uses the Tool's `OPEN_TERMINAL_CONNECTION` valve. If that valve is blank and
+exactly one enabled terminal is accessible, it selects that terminal automatically.
+This allows Mermaid rendering and file retrieval without attaching Open Terminal
+to every conversation. The Action uses the same configured-ID and single-terminal
+fallback because OpenWebUI v0.11 Action payloads do not include the chat selection.
+If several terminals are accessible, set each plugin's valve to the intended
+connection's internal ID, available in **Admin Settings → Integrations → Open
+Terminal**. A unique connection name remains supported as a fallback. Access
+control is checked before every render or file retrieval.
 
 For reliable Mermaid rendering, configure the **Open Terminal service** (not
 OpenWebUI or the notifier valves) with:
@@ -171,8 +177,8 @@ independently of the current chat working directory. They use unique visible
 filenames because Open Terminal's file API may reject hidden restricted folders.
 Generated PNGs are set to mode `644` before retrieval.
 
-No new notifier valve or shared Docker volume is required. The standard Open
-Terminal image includes Node.js. If Chromium or Mermaid CLI is unavailable,
+No shared Docker volume is required. The standard Open Terminal image includes
+Node.js. If Chromium or Mermaid CLI is unavailable,
 the email is still sent with the Mermaid source as a readable fallback.
 
 Mermaid safeguards:
@@ -222,10 +228,10 @@ Tests mock the SendGrid endpoint and never send real email.
   Review all code before installing it.
 - Give the SendGrid key only **Mail Send** permission.
 - Restrict tool availability if users should not be able to trigger notifications.
-- Tool attachment access is limited to the Open Terminal selected for the chat and
-  is checked against the same system connection access grants as OpenWebUI.
-- Mermaid rendering runs a pinned CLI package inside the selected or
-  Action-configured Open Terminal.
+- Tool attachment access is limited to the chat-selected, Tool-configured, or
+  automatically resolved Open Terminal and is checked against the same system
+  connection access grants as OpenWebUI.
+- Mermaid rendering runs a pinned CLI package inside the resolved Open Terminal.
   It does not send diagram source to a third-party rendering service.
 - The tool depends on OpenWebUI's current internal configuration API. Re-test
   attachments after major OpenWebUI upgrades.

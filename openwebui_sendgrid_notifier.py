@@ -4,7 +4,7 @@ author: Aikumi Partners
 author_url: https://aikumipartners.com
 description: Sends a Markdown email notification, optionally with Open Terminal files and rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
 required_open_webui_version: 0.11.0
-version: 1.4.0
+version: 1.4.1
 license: MIT
 """
 
@@ -242,6 +242,17 @@ class Tools:
                 "Set to 0 to disable rate limiting."
             ),
         )
+        OPEN_TERMINAL_CONNECTION: str = Field(
+            default="",
+            max_length=200,
+            description=(
+                "Optional system Open Terminal connection ID for Mermaid rendering "
+                "and attachments when no terminal is selected in the chat. Find it "
+                "in Admin Settings > Integrations > Open Terminal. A unique display "
+                "name is also accepted, or leave blank to use the only accessible "
+                "connection automatically."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -266,7 +277,7 @@ class Tools:
 
         :param subject: Short, descriptive email subject.
         :param message: Email body in Markdown. You may use headings, emphasis, lists, links, code blocks, concise tables, and Mermaid code blocks. Do not include raw HTML or remote images.
-        :param attachment_path: Optional absolute path to one file in the Open Terminal selected for this chat. Leave empty for no attachment.
+        :param attachment_path: Optional absolute path to one file in the resolved Open Terminal. Leave empty for no attachment.
         :return: A delivery confirmation or a safe error message.
         """
         try:
@@ -818,11 +829,6 @@ class Tools:
         metadata: Optional[dict],
         oauth_token: Optional[dict],
     ) -> TerminalContext:
-        terminal_id = str((metadata or {}).get("terminal_id") or "").strip()
-        if not terminal_id:
-            raise ValueError(
-                "No system-level Open Terminal connection is selected for this chat."
-            )
         if request is None:
             raise ValueError("OpenWebUI did not provide the request context.")
 
@@ -835,24 +841,75 @@ class Tools:
                 "This OpenWebUI version does not expose its Open Terminal configuration to tools."
             ) from exc
 
-        connections = await Config.get("terminal_server.connections", []) or []
-        connection = next(
-            (item for item in connections if item.get("id") == terminal_id), None
-        )
-        if connection is None:
-            raise ValueError("The selected Open Terminal connection was not found.")
-        if not connection.get("enabled", True):
-            raise ValueError("The selected Open Terminal connection is disabled.")
-
         user_id = str((user or {}).get("id") or "").strip()
         user_role = str((user or {}).get("role") or "user").strip()
         if not user_id:
             raise ValueError("The current OpenWebUI user has no valid user ID.")
 
         openwebui_user = SimpleNamespace(id=user_id, role=user_role)
+        connections = await Config.get("terminal_server.connections", []) or []
+        enabled_connections = [
+            item
+            for item in connections
+            if isinstance(item, dict) and item.get("enabled", True)
+        ]
+
+        injected_terminal_id = str(
+            (metadata or {}).get("terminal_id") or ""
+        ).strip()
+        configured_selector = self.valves.OPEN_TERMINAL_CONNECTION.strip()
+        selector = injected_terminal_id or configured_selector
+        connection = None
+
+        if selector:
+            connection = next(
+                (item for item in enabled_connections if item.get("id") == selector),
+                None,
+            )
+            if connection is None and not injected_terminal_id:
+                name_matches = [
+                    item
+                    for item in enabled_connections
+                    if str(item.get("name") or "").strip().casefold()
+                    == selector.casefold()
+                ]
+                if len(name_matches) == 1:
+                    connection = name_matches[0]
+                elif len(name_matches) > 1:
+                    raise ValueError(
+                        "More than one Open Terminal connection has the configured name; "
+                        "use its connection ID in the Tool valve."
+                    )
+            if connection is None:
+                source = (
+                    "selected for this chat"
+                    if injected_terminal_id
+                    else "configured for this Tool"
+                )
+                raise ValueError(
+                    f"The Open Terminal connection {source} was not found or is disabled."
+                )
+        else:
+            accessible_connections = []
+            for item in enabled_connections:
+                if await has_connection_access(openwebui_user, item):
+                    accessible_connections.append(item)
+            if len(accessible_connections) == 1:
+                connection = accessible_connections[0]
+            elif not accessible_connections:
+                raise ValueError(
+                    "No accessible system-level Open Terminal connection is available."
+                )
+            else:
+                raise ValueError(
+                    "Several Open Terminal connections are accessible. Set the "
+                    "OPEN_TERMINAL_CONNECTION Tool valve to the desired connection ID."
+                )
+
         if not await has_connection_access(openwebui_user, connection):
             raise ValueError(
-                "The current user cannot access the selected Open Terminal connection."
+                "The current user cannot access the Open Terminal connection selected "
+                "for this Tool."
             )
 
         base_url = get_terminal_server_url(connection)
