@@ -1,12 +1,17 @@
 # OpenWebUI SendGrid Notifier
 
-An OpenWebUI workspace tool that lets an LLM send an email notification to the
-current user. The destination is locked to the email address in the authenticated
-OpenWebUI user profile. It is not exposed as a tool argument or valve.
+An OpenWebUI workspace Tool and Action Function for sending email notifications
+to the current user. The Tool lets an LLM send a message; the Action adds an
+envelope button beneath assistant messages for one-click delivery. The destination
+is locked to the authenticated OpenWebUI user's account email.
 
 ## Features
 
 - Uses OpenWebUI's injected `__user__["email"]` as the only recipient
+- Adds an envelope Action beneath assistant messages for exact-message delivery
+- Shows a native success, information, or error notification after each Action click
+- Supports classic message content and Responses API structured output
+- Generates the Action email subject from the first heading or sentence
 - Keeps the SendGrid API key in an admin-configured password valve
 - Sends multipart plain-text and styled HTML email through SendGrid API v3
 - Converts Markdown headings, emphasis, lists, links, code blocks, and tables
@@ -21,7 +26,7 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
 - Uses only Python's standard library for HTTP requests
 - Masks the destination address in the tool result
 
-## Install
+## Install the Tool
 
 1. In OpenWebUI, open **Workspace → Tools → Create Tool**.
 2. Copy the complete contents of `openwebui_sendgrid_notifier.py` into the editor.
@@ -34,10 +39,44 @@ OpenWebUI user profile. It is not exposed as a tool argument or valve.
      set to `0` to disable the cooldown
 5. Enable the tool for the desired model or select it in a chat.
 
-No additional Open Terminal valves are required. Configure Open Terminal once in
-**Admin Settings → Integrations → Open Terminal**. When an attachment is
-requested, the tool uses the terminal selected for the current chat and reads its
-connection from OpenWebUI's own `terminal_server.connections` configuration.
+## Install the message Action
+
+1. In OpenWebUI, open **Admin Panel → Functions → Add Function**.
+2. Copy the complete contents of `openwebui_sendgrid_email_action.py` into the
+   editor and save it.
+3. Open the Function's **Valves** and configure:
+   - `SENDGRID_API_KEY`: the same SendGrid key used by the Tool
+   - `SENDER_EMAIL`: the same verified SendGrid sender
+   - `SENDER_NAME`: the sender display name
+   - `RATE_LIMIT_MINUTES`: Action-specific cooldown; defaults to `10`
+   - `SUBJECT_PREFIX`: optional text placed before the generated subject
+   - `OPEN_TERMINAL_CONNECTION`: leave blank when the user has access to only one
+     system Open Terminal; otherwise enter the connection's internal ID from
+     **Admin Settings → Integrations → Open Terminal**. The ID is preferred over
+     the display name.
+   - `priority`: toolbar button order; lower values appear first
+4. Enable the Function globally, or attach it to the desired model(s).
+5. Click the envelope button beneath an assistant message. The Action emails that
+   exact message and leaves the chat message unchanged.
+
+The Tool and Action are separate OpenWebUI plugins, so their valves are stored
+separately. Copy the SendGrid values once when installing the Action. The Action
+does not ask for a recipient or subject: it uses the signed-in user's email and
+derives the subject automatically.
+
+The Action receives the clicked message ID and selects that exact assistant turn,
+even when later assistant messages exist. It reads ordinary `content`, rich text
+content arrays, and Responses API `output_text` blocks. Non-text parts and hidden
+reasoning blocks are not emailed.
+
+No additional Open Terminal URL or credential valves are required. Configure Open
+Terminal once in **Admin Settings → Integrations → Open Terminal**. When an
+attachment is requested, the Tool uses the terminal selected for the current chat.
+For Mermaid rendering, the Action uses its optional connection selector only when
+more than one accessible system terminal exists. Use the connection's internal ID
+from **Admin Settings → Integrations → Open Terminal**. A unique display name is
+also accepted for compatibility, but the immutable ID is more reliable. Both
+plugins read the URL and credentials from OpenWebUI's own configuration.
 
 The sender address is configurable because SendGrid requires a verified sender.
 The recipient is deliberately not configurable.
@@ -87,8 +126,8 @@ headings, bold, italic, strikethrough, lists, links, blockquotes, fenced code,
 horizontal rules, and GitHub-style tables. Raw HTML is escaped, remote Markdown
 images are omitted, and links are restricted to `http`, `https`, and `mailto`.
 
-Fenced `mermaid` blocks are rendered automatically when a system-level Open
-Terminal is selected for the chat:
+Fenced `mermaid` blocks are rendered automatically through a system-level Open
+Terminal:
 
 ````markdown
 ```mermaid
@@ -103,6 +142,14 @@ The notifier invokes Mermaid CLI in Open Terminal, downloads the generated PNG,
 and embeds it using a SendGrid inline CID attachment. It uses an existing `mmdc`
 binary when available; otherwise it runs the pinned
 `@mermaid-js/mermaid-cli@11.16.0` package through `npx`.
+
+The Tool uses the Open Terminal selected in the chat. OpenWebUI v0.11 Action
+payloads do not include that selection, so the Action automatically uses the only
+enabled system terminal accessible to the current user. If several are accessible,
+set the Action's `OPEN_TERMINAL_CONNECTION` valve to the intended connection's
+internal ID, available in **Admin Settings → Integrations → Open Terminal**. A
+unique connection name remains supported as a fallback. Access control is checked
+before every render.
 
 For reliable Mermaid rendering, configure the **Open Terminal service** (not
 OpenWebUI or the notifier valves) with:
@@ -144,9 +191,9 @@ Mermaid safeguards:
 
 ## Delivery safeguards
 
-- **Idempotency:** OpenWebUI's injected `__message_id__` identifies the active
-  assistant turn. Once a notification for that message succeeds, repeat calls are
-  suppressed for 24 hours, even if the model changes the subject or body.
+- **Idempotency:** the active or clicked assistant message ID identifies the turn.
+  Once a notification for that message succeeds, repeat calls through the same
+  plugin are suppressed for 24 hours.
 - **Per-user rate limit:** only one successful delivery is allowed per user during
   `RATE_LIMIT_MINUTES`. The authenticated OpenWebUI user ID is used when available;
   otherwise the normalized account email is used.
@@ -155,10 +202,10 @@ Mermaid safeguards:
 - **Concurrency:** simultaneous calls for the same user are serialized by the
   safeguards, preventing two requests from passing the checks together.
 
-Safeguard state is held in memory and shared by all tool instances in one Python
-process. It resets when OpenWebUI restarts and is not shared between multiple
-OpenWebUI workers or replicas. Use a shared persistent store if you require
-cross-process or restart-safe enforcement.
+Safeguard state is held in memory and shared by instances of the same Tool or
+Action in one Python process. Tool and Action state are independent. It resets when
+OpenWebUI restarts and is not shared between multiple workers or replicas. Use a
+shared persistent store if you require cross-process or restart-safe enforcement.
 
 ## Test
 
@@ -171,13 +218,14 @@ Tests mock the SendGrid endpoint and never send real email.
 
 ## Security notes
 
-- OpenWebUI workspace tools execute inside the OpenWebUI server process. Review
-  all tool code before installing it.
+- OpenWebUI Tools and Functions execute inside the OpenWebUI server process.
+  Review all code before installing it.
 - Give the SendGrid key only **Mail Send** permission.
 - Restrict tool availability if users should not be able to trigger notifications.
-- Attachment access is limited to the Open Terminal selected for the chat and is
-  checked against the same system connection access grants as OpenWebUI.
-- Mermaid rendering runs a pinned CLI package inside the selected Open Terminal.
+- Tool attachment access is limited to the Open Terminal selected for the chat and
+  is checked against the same system connection access grants as OpenWebUI.
+- Mermaid rendering runs a pinned CLI package inside the selected or
+  Action-configured Open Terminal.
   It does not send diagram source to a third-party rendering service.
 - The tool depends on OpenWebUI's current internal configuration API. Re-test
   attachments after major OpenWebUI upgrades.

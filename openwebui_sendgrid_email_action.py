@@ -1,10 +1,12 @@
 """
-title: SendGrid Email Notification
+title: Email This Message
 author: Aikumi Partners
 author_url: https://aikumipartners.com
-description: Sends a Markdown email notification, optionally with Open Terminal files and rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
+description: Adds an email button to assistant messages and sends the clicked Markdown message, including rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
 required_open_webui_version: 0.11.0
 version: 1.4.0
+icon_url: https://raw.githubusercontent.com/tiangao88/openwebui-sendgrid-notifier/910d3283a265b21639dd7790592f3780e1dfe9fc/assets/email-action.svg
+requirements: Markdown>=3.10,pydantic>=2.0,pymdown-extensions>=10.21
 license: MIT
 """
 
@@ -194,8 +196,8 @@ class _EmailHTMLSanitizer(HTMLParser):
         return href if scheme in {"http", "https", "mailto"} else ""
 
 
-class Tools:
-    # OpenWebUI can create more than one Tools instance in a process. Class-level
+class Action:
+    # OpenWebUI can create more than one Action instance in a process. Class-level
     # state makes the safeguards apply across those instances.
     _state_lock: ClassVar[threading.Lock] = threading.Lock()
     _last_delivery_by_user: ClassVar[dict[str, float]] = {}
@@ -218,6 +220,11 @@ class Tools:
     _MARKDOWN_IMAGE_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"!\[([^\]]*)\]\([^\n)]*\)"
     )
+
+    _ATX_HEADING_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"^\s{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*\s*$"
+    )
+    _FENCE_LINE_RE: ClassVar[re.Pattern[str]] = re.compile(r"^\s*(`{3,}|~{3,})")
 
     class Valves(BaseModel):
         SENDGRID_API_KEY: str = Field(
@@ -242,9 +249,278 @@ class Tools:
                 "Set to 0 to disable rate limiting."
             ),
         )
+        SUBJECT_PREFIX: str = Field(
+            default="",
+            max_length=80,
+            description=(
+                "Optional text placed before the automatically generated email subject."
+            ),
+        )
+        OPEN_TERMINAL_CONNECTION: str = Field(
+            default="",
+            max_length=200,
+            description=(
+                "Optional system Open Terminal connection ID for Mermaid rendering. "
+                "Find it in Admin Settings > Integrations > Open Terminal. A unique "
+                "display name is also accepted, or leave blank to use the only "
+                "accessible connection automatically."
+            ),
+        )
+        priority: int = Field(
+            default=0,
+            ge=-1_000,
+            le=1_000,
+            description=(
+                "Button order in the assistant-message toolbar; lower values appear first."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
+
+    async def action(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __message_id__: Optional[str] = None,
+        __request__=None,
+        __oauth_token__: Optional[dict] = None,
+        __event_emitter__: Optional[EventEmitter] = None,
+    ) -> None:
+        """Email the assistant message whose toolbar button was clicked."""
+        try:
+            selected = self._select_clicked_message(body)
+            message = self._extract_message_text(selected)
+            subject = self._derive_subject(message)
+            message_id = str(
+                selected.get("id")
+                or (body or {}).get("id")
+                or __message_id__
+                or ""
+            ).strip()
+            metadata = self._merge_action_metadata(body, selected, __metadata__)
+
+            result = await self.send_email_notification(
+                subject=subject,
+                message=message,
+                __user__=__user__,
+                __message_id__=message_id,
+                __metadata__=metadata,
+                __request__=__request__,
+                __oauth_token__=__oauth_token__,
+                __event_emitter__=__event_emitter__,
+            )
+
+            if result.startswith("Email notification sent successfully"):
+                notification_type = "success"
+            elif "duplicate suppressed" in result:
+                notification_type = "info"
+            else:
+                notification_type = "error"
+            await self._notify(__event_emitter__, notification_type, result)
+        except ValueError as exc:
+            detail = f"Email notification was not sent: {exc}"
+            await self._emit(__event_emitter__, str(exc), True, "error")
+            await self._notify(__event_emitter__, "error", detail)
+        except Exception as exc:
+            # Keep secrets and raw provider responses out of the browser notification.
+            print(f"Email This Message action failed: {type(exc).__name__}")
+            detail = (
+                "Email notification was not sent because an unexpected error occurred. "
+                "Check the OpenWebUI server log."
+            )
+            await self._best_effort_notify(__event_emitter__, "error", detail)
+        return None
+
+    @classmethod
+    def _select_clicked_message(cls, body: dict) -> dict:
+        if not isinstance(body, dict):
+            raise ValueError("OpenWebUI did not provide a valid action payload.")
+
+        clicked_id = str(body.get("id") or body.get("message_id") or "").strip()
+        messages = body.get("messages")
+        candidates = (
+            [item for item in messages if isinstance(item, dict)]
+            if isinstance(messages, list)
+            else []
+        )
+
+        selected: Optional[dict] = None
+        if clicked_id:
+            selected = next(
+                (
+                    item
+                    for item in reversed(candidates)
+                    if str(item.get("id") or item.get("message_id") or "").strip()
+                    == clicked_id
+                ),
+                None,
+            )
+            if selected is None and str(
+                body.get("id") or body.get("message_id") or ""
+            ).strip() == clicked_id and (
+                "content" in body or "output" in body
+            ):
+                selected = body
+            if selected is None:
+                raise ValueError("The clicked assistant message could not be found.")
+        elif str(body.get("role") or "").casefold() == "assistant":
+            selected = body
+        else:
+            selected = next(
+                (
+                    item
+                    for item in reversed(candidates)
+                    if str(item.get("role") or "").casefold() == "assistant"
+                ),
+                None,
+            )
+
+        if selected is None:
+            raise ValueError("No assistant message is available to email.")
+        role = str(selected.get("role") or "").casefold()
+        if role and role != "assistant":
+            raise ValueError("Only assistant messages can be emailed with this action.")
+        return selected
+
+    @classmethod
+    def _extract_message_text(cls, message: dict) -> str:
+        content_parts = cls._collect_text_parts(message.get("content"))
+        content = "\n\n".join(part.strip() for part in content_parts if part.strip())
+        if content:
+            return content
+
+        output_parts: list[str] = []
+        output = message.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").casefold()
+                item_role = str(item.get("role") or "").casefold()
+                if item_type == "message" or item_role == "assistant":
+                    output_parts.extend(cls._collect_text_parts(item.get("content")))
+                elif item_type in {"text", "output_text"}:
+                    output_parts.extend(cls._collect_text_parts(item))
+
+        content = "\n\n".join(part.strip() for part in output_parts if part.strip())
+        if not content:
+            raise ValueError("The clicked assistant message contains no email-ready text.")
+        return content
+
+    @classmethod
+    def _collect_text_parts(cls, value) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                parts.extend(cls._collect_text_parts(item))
+            return parts
+        if not isinstance(value, dict):
+            return []
+
+        item_type = str(value.get("type") or "").casefold()
+        text = value.get("text")
+        if isinstance(text, str) and item_type in {"", "text", "output_text"}:
+            return [text]
+        if item_type in {"", "message"} and "content" in value:
+            return cls._collect_text_parts(value.get("content"))
+        return []
+
+    @staticmethod
+    def _merge_action_metadata(
+        body: dict, selected: dict, injected: Optional[dict]
+    ) -> dict:
+        metadata: dict = {}
+        for source in (body.get("metadata"), selected.get("metadata"), injected):
+            if isinstance(source, dict):
+                metadata.update(source)
+        for key in ("terminal_id", "chat_id", "session_id"):
+            value = body.get(key)
+            if value not in (None, ""):
+                metadata.setdefault(key, value)
+        return metadata
+
+    def _derive_subject(self, message: str) -> str:
+        visible_lines = self._lines_outside_fences(message)
+        candidate = ""
+        for line in visible_lines:
+            heading = self._ATX_HEADING_RE.match(line)
+            if heading:
+                candidate = heading.group(1)
+                break
+
+        if not candidate:
+            for line in visible_lines:
+                stripped = line.strip()
+                if not stripped or re.fullmatch(r"[-:| \t]+", stripped):
+                    continue
+                candidate = stripped
+                break
+
+        candidate = self._plain_subject_text(candidate) or "OpenWebUI message"
+        sentence = re.split(r"(?<=[.!?])\s+", candidate, maxsplit=1)[0]
+        prefix = " ".join(self.valves.SUBJECT_PREFIX.split())
+        if prefix:
+            prefix += " "
+        available = max(1, 200 - len(prefix))
+        if len(sentence) > available:
+            sentence = sentence[: max(1, available - 1)].rstrip() + "…"
+        return self._clean_subject(f"{prefix}{sentence}")
+
+    @classmethod
+    def _lines_outside_fences(cls, message: str) -> list[str]:
+        visible: list[str] = []
+        fence_marker = ""
+        for line in message.splitlines():
+            fence = cls._FENCE_LINE_RE.match(line)
+            if fence:
+                marker = fence.group(1)
+                if not fence_marker:
+                    fence_marker = marker[0]
+                elif marker.startswith(fence_marker):
+                    fence_marker = ""
+                continue
+            if not fence_marker:
+                visible.append(line)
+        return visible
+
+    @staticmethod
+    def _plain_subject_text(value: str) -> str:
+        text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value)
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"^\s*>+\s*", "", text)
+        text = re.sub(r"^\s*(?:[-+*]|\d+[.)])\s+", "", text)
+        text = text.replace(chr(96), "")
+        text = re.sub(r"[*_~]", "", text)
+        return " ".join(html.unescape(text).split()).strip()
+
+    @staticmethod
+    async def _notify(
+        emitter: Optional[EventEmitter], notification_type: str, content: str
+    ) -> None:
+        if emitter:
+            await emitter(
+                {
+                    "type": "notification",
+                    "data": {
+                        "type": notification_type,
+                        "content": content[:1_000],
+                    },
+                }
+            )
+
+    @classmethod
+    async def _best_effort_notify(
+        cls, emitter: Optional[EventEmitter], notification_type: str, content: str
+    ) -> None:
+        try:
+            await cls._notify(emitter, notification_type, content)
+        except Exception:
+            pass
 
     async def send_email_notification(
         self,
@@ -754,7 +1030,7 @@ class Tools:
             headers={
                 **headers,
                 "Content-Type": "application/json",
-                "User-Agent": "openwebui-sendgrid-notifier/1.4",
+                "User-Agent": "openwebui-sendgrid-email-action/1.4",
             },
             method=method,
         )
@@ -818,11 +1094,6 @@ class Tools:
         metadata: Optional[dict],
         oauth_token: Optional[dict],
     ) -> TerminalContext:
-        terminal_id = str((metadata or {}).get("terminal_id") or "").strip()
-        if not terminal_id:
-            raise ValueError(
-                "No system-level Open Terminal connection is selected for this chat."
-            )
         if request is None:
             raise ValueError("OpenWebUI did not provide the request context.")
 
@@ -835,24 +1106,72 @@ class Tools:
                 "This OpenWebUI version does not expose its Open Terminal configuration to tools."
             ) from exc
 
-        connections = await Config.get("terminal_server.connections", []) or []
-        connection = next(
-            (item for item in connections if item.get("id") == terminal_id), None
-        )
-        if connection is None:
-            raise ValueError("The selected Open Terminal connection was not found.")
-        if not connection.get("enabled", True):
-            raise ValueError("The selected Open Terminal connection is disabled.")
-
         user_id = str((user or {}).get("id") or "").strip()
         user_role = str((user or {}).get("role") or "user").strip()
         if not user_id:
             raise ValueError("The current OpenWebUI user has no valid user ID.")
 
         openwebui_user = SimpleNamespace(id=user_id, role=user_role)
+        connections = await Config.get("terminal_server.connections", []) or []
+        enabled_connections = [
+            item
+            for item in connections
+            if isinstance(item, dict) and item.get("enabled", True)
+        ]
+
+        injected_terminal_id = str(
+            (metadata or {}).get("terminal_id") or ""
+        ).strip()
+        configured_selector = self.valves.OPEN_TERMINAL_CONNECTION.strip()
+        selector = injected_terminal_id or configured_selector
+        connection = None
+
+        if selector:
+            connection = next(
+                (item for item in enabled_connections if item.get("id") == selector),
+                None,
+            )
+            if connection is None and not injected_terminal_id:
+                name_matches = [
+                    item
+                    for item in enabled_connections
+                    if str(item.get("name") or "").strip().casefold()
+                    == selector.casefold()
+                ]
+                if len(name_matches) == 1:
+                    connection = name_matches[0]
+                elif len(name_matches) > 1:
+                    raise ValueError(
+                        "More than one Open Terminal connection has the configured name; "
+                        "use its connection ID in the Action valve."
+                    )
+            if connection is None:
+                raise ValueError(
+                    "The Open Terminal connection configured for this Action was not found "
+                    "or is disabled."
+                )
+        else:
+            accessible_connections = []
+            for item in enabled_connections:
+                if await has_connection_access(openwebui_user, item):
+                    accessible_connections.append(item)
+            if len(accessible_connections) == 1:
+                connection = accessible_connections[0]
+            elif not accessible_connections:
+                raise ValueError(
+                    "No accessible system-level Open Terminal connection is available for "
+                    "Mermaid rendering."
+                )
+            else:
+                raise ValueError(
+                    "Several Open Terminal connections are accessible. Set the "
+                    "OPEN_TERMINAL_CONNECTION Action valve to the desired name or ID."
+                )
+
         if not await has_connection_access(openwebui_user, connection):
             raise ValueError(
-                "The current user cannot access the selected Open Terminal connection."
+                "The current user cannot access the Open Terminal connection selected "
+                "for this Action."
             )
 
         base_url = get_terminal_server_url(connection)
@@ -885,7 +1204,21 @@ class Tools:
             if cookie:
                 headers["Cookie"] = cookie
         elif auth_type == "system_oauth":
-            access_token = str((oauth_token or {}).get("access_token") or "").strip()
+            resolved_oauth_token = oauth_token
+            if not resolved_oauth_token:
+                oauth_session_id = request.cookies.get("oauth_session_id", None)
+                if oauth_session_id:
+                    try:
+                        resolved_oauth_token = (
+                            await request.app.state.oauth_manager.get_oauth_token(
+                                user_id, oauth_session_id
+                            )
+                        )
+                    except Exception:
+                        resolved_oauth_token = None
+            access_token = str(
+                (resolved_oauth_token or {}).get("access_token") or ""
+            ).strip()
             if not access_token:
                 raise ValueError("The Open Terminal OAuth credentials are unavailable.")
             headers["Authorization"] = f"Bearer {access_token}"
@@ -910,7 +1243,7 @@ class Tools:
             url,
             headers={
                 **terminal.headers,
-                "User-Agent": "openwebui-sendgrid-notifier/1.4",
+                "User-Agent": "openwebui-sendgrid-email-action/1.4",
             },
             method="GET",
         )
@@ -1157,7 +1490,7 @@ class Tools:
             headers={
                 "Authorization": f"Bearer {self.valves.SENDGRID_API_KEY.strip()}",
                 "Content-Type": "application/json",
-                "User-Agent": "openwebui-sendgrid-notifier/1.4",
+                "User-Agent": "openwebui-sendgrid-email-action/1.4",
             },
             method="POST",
         )
