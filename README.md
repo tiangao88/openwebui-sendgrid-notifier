@@ -51,8 +51,9 @@ is locked to the authenticated OpenWebUI user's account email.
    - `RATE_LIMIT_MINUTES`: Action-specific cooldown; defaults to `10`
    - `SUBJECT_PREFIX`: optional text placed before the generated subject
    - `OPEN_TERMINAL_CONNECTION`: leave blank when the user has access to only one
-     system Open Terminal; otherwise enter the connection name or ID, such as
-     `MyCloud`
+     system Open Terminal; otherwise enter the connection's internal ID from
+     **Admin Settings → Integrations → Open Terminal**. The ID is preferred over
+     the display name.
    - `priority`: toolbar button order; lower values appear first
 4. Enable the Function globally, or attach it to the desired model(s).
 5. Click the envelope button beneath an assistant message. The Action emails that
@@ -71,9 +72,11 @@ reasoning blocks are not emailed.
 No additional Open Terminal URL or credential valves are required. Configure Open
 Terminal once in **Admin Settings → Integrations → Open Terminal**. When an
 attachment is requested, the Tool uses the terminal selected for the current chat.
-For Mermaid rendering, the Action uses its optional connection-name/ID selector
-only when more than one accessible system terminal exists. Both plugins read the
-URL and credentials from OpenWebUI's own configuration.
+For Mermaid rendering, the Action uses its optional connection selector only when
+more than one accessible system terminal exists. Use the connection's internal ID
+from **Admin Settings → Integrations → Open Terminal**. A unique display name is
+also accepted for compatibility, but the immutable ID is more reliable. Both
+plugins read the URL and credentials from OpenWebUI's own configuration.
 
 The sender address is configurable because SendGrid requires a verified sender.
 The recipient is deliberately not configurable.
@@ -143,8 +146,10 @@ binary when available; otherwise it runs the pinned
 The Tool uses the Open Terminal selected in the chat. OpenWebUI v0.11 Action
 payloads do not include that selection, so the Action automatically uses the only
 enabled system terminal accessible to the current user. If several are accessible,
-set the Action's `OPEN_TERMINAL_CONNECTION` valve to the intended connection name
-or ID. Access control is checked before every render.
+set the Action's `OPEN_TERMINAL_CONNECTION` valve to the intended connection's
+internal ID, available in **Admin Settings → Integrations → Open Terminal**. A
+unique connection name remains supported as a fallback. Access control is checked
+before every render.
 
 For reliable Mermaid rendering, configure the **Open Terminal service** (not
 OpenWebUI or the notifier valves) with:
