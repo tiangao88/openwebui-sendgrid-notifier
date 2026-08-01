@@ -5,7 +5,7 @@ author_url: https://aikumipartners.com
 description: Adds an email button to assistant messages and sends the clicked Markdown message, including rendered Mermaid diagrams, to the current OpenWebUI user's account email through SendGrid.
 required_open_webui_version: 0.11.0
 version: 1.4.0
-icon_url: https://raw.githubusercontent.com/tiangao88/openwebui-sendgrid-notifier/main/assets/email-action.svg
+icon_url: https://raw.githubusercontent.com/tiangao88/openwebui-sendgrid-notifier/910d3283a265b21639dd7790592f3780e1dfe9fc/assets/email-action.svg
 requirements: Markdown>=3.10,pydantic>=2.0,pymdown-extensions>=10.21
 license: MIT
 """
@@ -260,8 +260,10 @@ class Action:
             default="",
             max_length=200,
             description=(
-                "Optional system Open Terminal connection name or ID for Mermaid rendering. "
-                "Leave blank to use the only accessible connection automatically."
+                "Optional system Open Terminal connection ID for Mermaid rendering. "
+                "Find it in Admin Settings > Integrations > Open Terminal. A unique "
+                "display name is also accepted, or leave blank to use the only "
+                "accessible connection automatically."
             ),
         )
         priority: int = Field(
