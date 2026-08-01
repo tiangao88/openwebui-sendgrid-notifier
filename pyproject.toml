@@ -1,6 +1,6 @@
 [project]
 name = "openwebui-sendgrid-notifier"
-version = "1.4.0"
+version = "1.4.1"
 description = "An OpenWebUI tool and message action that send Markdown email notifications with rendered Mermaid diagrams to the current user's account email."
 requires-python = ">=3.11"
 dependencies = [
